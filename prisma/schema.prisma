@@ -1,0 +1,121 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                     String          @id @default(uuid())
+  name                   String?
+  email                  String          @unique // provider 이메일
+  trustedEmail           String?         @unique // 사용자가 직접 입력한 신뢰 이메일
+  emailVerified          DateTime? // trustedEmail 인증 완료 시각
+  lastVerificationSentAt DateTime? // 마지막 인증 메일 발송 시각
+  provider               String?
+  password               String?         @db.VarChar(255)
+  image                  String?
+  createdAt              DateTime        @default(now())
+  updatedAt              DateTime        @updatedAt
+  role                   Role            @default(USER)
+  status                 UserStatus      @default(ACTIVE)
+  mfaEnabled             Boolean         @default(false)
+  mfaSecret              String?         @db.VarChar(255)
+  mfaVerifiedAt          DateTime?
+  accounts               Account[]
+  sessions               Session[]
+  verifiedEmails         VerifiedEmail[]
+  companies              Company[]       @relation("UserCompanies")
+
+  @@index([email])
+  @@index([trustedEmail])
+}
+
+model Account {
+  id                String   @id @default(uuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  access_token      String?  @db.Text
+  refresh_token     String?  @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?  @db.Text
+  session_state     String?
+  user              User     @relation(fields: [userId], references: [id])
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(uuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id])
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String           @id @default(uuid())
+  identifier String           @db.VarChar(255) // trustedEmail 또는 사용자 ID
+  value      String           @unique // 토큰 값
+  type       VerificationType
+  expiresAt  DateTime
+  consumedAt DateTime? // 사용 완료 시각
+  createdAt  DateTime         @default(now())
+
+  @@index([identifier])
+}
+
+model VerifiedEmail {
+  id         String   @id @default(uuid())
+  email      String   @unique
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  verifiedAt DateTime @default(now())
+  ipAddress  String?
+  userAgent  String?
+
+  @@index([userId])
+}
+
+model Company {
+  id         String   @id @default(uuid())
+  name       String
+  subdomain  String   @unique
+  adminEmail String
+  createdAt  DateTime @default(now())
+  createdBy  String
+  creator    User     @relation("UserCompanies", fields: [createdBy], references: [id])
+
+  @@index([createdBy])
+}
+
+enum VerificationType {
+  EMAIL
+  PASSWORD_RESET
+}
+
+enum Role {
+  USER
+  ADMIN
+  MODERATOR
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+  PENDING
+}
