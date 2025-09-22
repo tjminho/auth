@@ -4,10 +4,18 @@ import { signIn } from "next-auth/react";
 import { z } from "zod";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { toast } from "sonner";
+import { useSession } from "next-auth/react";
+import { useRouter } from "next/navigation";
 
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -19,32 +27,54 @@ const SignInSchema = z.object({
 
 export default function SignInPage() {
   const [loading, setLoading] = useState(false);
+  const { data: session, status } = useSession();
+  const router = useRouter();
+
+  // 로그인 상태면 홈으로 이동
+  useEffect(() => {
+    if (status === "authenticated") {
+      router.replace("/");
+    }
+  }, [status, router]);
 
   const form = useForm<z.infer<typeof SignInSchema>>({
     resolver: zodResolver(SignInSchema),
+    defaultValues: { email: "", password: "" },
   });
 
   async function onSubmit(values: z.infer<typeof SignInSchema>) {
     setLoading(true);
     const res = await signIn("credentials", {
-      redirect: false,
+      redirect: false, // 수동 이동
       email: values.email,
       password: values.password,
-      callbackUrl: "/dashboard",
+      callbackUrl: "/", // 로그인 후 홈
     });
     setLoading(false);
 
     if (!res) return;
+
     if (res.error) {
-      // Auth.js에서 문자열로 경로를 반환하면 그대로 이동
-      if (res.error.startsWith("/")) {
-        window.location.href = res.error;
+      form.setValue("password", "");
+      if (res.error.includes("로그인 시도가 너무 많습니다")) {
+        toast.error(res.error, { position: "top-center" });
       } else {
-        toast.error(res.error);
+        toast.error("이메일 또는 비밀번호가 올바르지 않습니다.", {
+          position: "top-center",
+        });
       }
       return;
     }
-    window.location.href = res.url ?? "/dashboard";
+
+    // 로그인 성공 → 홈으로 이동
+    if (res.url) {
+      router.push(res.url);
+    }
+  }
+
+  // 세션 로딩 중이면 아무것도 안 보여줌
+  if (status === "loading") {
+    return null;
   }
 
   return (
@@ -57,7 +87,6 @@ export default function SignInPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* Credentials Form */}
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
             <div className="space-y-2">
               <Label htmlFor="email">이메일</Label>
@@ -94,7 +123,6 @@ export default function SignInPage() {
             </Button>
           </form>
 
-          {/* Divider */}
           <div className="relative my-4">
             <div className="absolute inset-0 flex items-center">
               <span className="w-full border-t" />
@@ -106,23 +134,22 @@ export default function SignInPage() {
             </div>
           </div>
 
-          {/* OAuth Buttons */}
           <div className="grid gap-2">
             <Button
               variant="outline"
-              onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+              onClick={() => signIn("google", { callbackUrl: "/" })}
             >
               Google로 계속하기
             </Button>
             <Button
               variant="outline"
-              onClick={() => signIn("kakao", { callbackUrl: "/dashboard" })}
+              onClick={() => signIn("kakao", { callbackUrl: "/" })}
             >
               Kakao로 계속하기
             </Button>
             <Button
               variant="outline"
-              onClick={() => signIn("naver", { callbackUrl: "/dashboard" })}
+              onClick={() => signIn("naver", { callbackUrl: "/" })}
             >
               Naver로 계속하기
             </Button>

@@ -21,6 +21,7 @@ model User {
   updatedAt              DateTime        @updatedAt
   role                   Role            @default(USER)
   status                 UserStatus      @default(ACTIVE)
+  subscriptionExpiresAt  DateTime? // 구독 만료일 (SUBSCRIBER용)
   mfaEnabled             Boolean         @default(false)
   mfaSecret              String?         @db.VarChar(255)
   mfaVerifiedAt          DateTime?
@@ -29,8 +30,7 @@ model User {
   verifiedEmails         VerifiedEmail[]
   companies              Company[]       @relation("UserCompanies")
 
-  @@index([email])
-  @@index([trustedEmail])
+  // @unique로 이미 인덱스가 생성되므로 @@index 제거
 }
 
 model Account {
@@ -46,7 +46,7 @@ model Account {
   scope             String?
   id_token          String?  @db.Text
   session_state     String?
-  user              User     @relation(fields: [userId], references: [id])
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
@@ -59,7 +59,7 @@ model Session {
   sessionToken String   @unique
   userId       String
   expires      DateTime
-  user         User     @relation(fields: [userId], references: [id])
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -69,12 +69,14 @@ model Session {
 model Verification {
   id         String           @id @default(uuid())
   identifier String           @db.VarChar(255) // trustedEmail 또는 사용자 ID
-  value      String           @unique // 토큰 값
+  value      String // 토큰 값
   type       VerificationType
   expiresAt  DateTime
   consumedAt DateTime? // 사용 완료 시각
   createdAt  DateTime         @default(now())
 
+  @@unique([identifier, type])
+  @@index([value])
   @@index([identifier])
 }
 
@@ -82,7 +84,7 @@ model VerifiedEmail {
   id         String   @id @default(uuid())
   email      String   @unique
   userId     String
-  user       User     @relation(fields: [userId], references: [id])
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   verifiedAt DateTime @default(now())
   ipAddress  String?
   userAgent  String?
@@ -108,9 +110,10 @@ enum VerificationType {
 }
 
 enum Role {
-  USER
-  ADMIN
-  MODERATOR
+  USER // 기본 사용자
+  SUBSCRIBER // 유료 구독자
+  MODERATOR // 커뮤니티 관리자
+  ADMIN // 시스템 관리자
 }
 
 enum UserStatus {

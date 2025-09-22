@@ -40,3 +40,27 @@ export class RateLimiter {
     return { allowed, remaining, reset };
   }
 }
+
+// ===== 기본 API 제한 =====
+const defaultLimiter = new RateLimiter({
+  windowSeconds: 60,
+  max: 5,
+  prefix: "rl",
+});
+
+export async function hit(ip: string, key: string) {
+  const r = await defaultLimiter.check(`${ip}:${key}`);
+  return { limited: !r.allowed, remaining: r.remaining, reset: r.reset };
+}
+
+// ===== 로그인 전용 제한 =====
+const loginLimiter = new RateLimiter({
+  windowSeconds: 600, // 10분
+  max: 10, // 10회 허용
+  prefix: "login",
+});
+
+export async function hitLogin(ip: string, email: string) {
+  const r = await loginLimiter.check(`${ip}:${email}`);
+  return { limited: !r.allowed, remaining: r.remaining, reset: r.reset };
+}

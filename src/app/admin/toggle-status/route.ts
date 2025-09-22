@@ -1,4 +1,3 @@
-// src/app/admin/toggle-status/route.ts
 import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";

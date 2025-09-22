@@ -1,41 +1,73 @@
 import { NextResponse } from "next/server";
+import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { createAndEmailVerificationToken } from "@/lib/verification";
+import { emailSchema } from "@/lib/validation";
+import { logger } from "@/lib/logger";
 
 export async function POST(req: Request) {
   try {
-    const { userId, email } = await req.json();
-
-    if (!userId || !email) {
-      return NextResponse.json(
-        { error: "필수 값이 누락되었습니다." },
-        { status: 400 }
-      );
+    // 1. 세션 확인
+    const session = await auth();
+    if (!session?.user?.id) {
+      logger.warn("다른 이메일 설정 실패: 인증되지 않은 요청");
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      return NextResponse.json(
-        { error: "사용자를 찾을 수 없습니다." },
-        { status: 404 }
-      );
+    // 2. 요청 바디 파싱 및 이메일 형식 검증
+    const { email } = await req.json();
+    if (!emailSchema.safeParse(email).success) {
+      return NextResponse.json({ error: "invalid_email" }, { status: 400 });
     }
 
-    // trustedEmail 저장 및 인증 상태 초기화
-    await prisma.user.update({
-      where: { id: userId },
-      data: { trustedEmail: email, emailVerified: null },
+    // 3. 현재 유저 조회
+    const user = await prisma.user.findUnique({
+      where: { id: session.user.id },
     });
+    if (!user) {
+      logger.warn("다른 이메일 설정 실패: 유저 없음", {
+        userId: session.user.id,
+      });
+      return NextResponse.json({ error: "user_not_found" }, { status: 404 });
+    }
 
-    // 인증 메일 발송 (쿨다운 포함)
-    await createAndEmailVerificationToken(email);
+    // 4. trustedEmail 업데이트 (중복 처리)
+    try {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { trustedEmail: email },
+      });
+    } catch (err: any) {
+      if (err.code === "P2002") {
+        logger.warn("다른 이메일 설정 실패: 이미 사용 중인 이메일", { email });
+        return NextResponse.json(
+          { error: "이미 사용 중인 이메일입니다." },
+          { status: 400 }
+        );
+      }
+      throw err;
+    }
 
-    return NextResponse.json({ success: true });
+    // 5. 인증 메일 발송
+    const ip =
+      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined;
+    await createAndEmailVerificationToken(email, { ip });
+
+    logger.info("다른 이메일 인증 메일 발송 완료", {
+      userId: user.id,
+      email,
+      ip,
+    });
+    return NextResponse.json({ ok: true, session: "updated" });
   } catch (err: any) {
-    console.error(err);
-    return NextResponse.json(
-      { error: err?.message || "이메일 설정 실패" },
-      { status: 400 }
-    );
+    const msg =
+      typeof err?.message === "string" ? err.message : "failed_to_send";
+    const status = msg.includes("잠시 후") ? 429 : 500;
+
+    logger.error("다른 이메일 설정 처리 중 오류", {
+      error: msg,
+      stack: err?.stack,
+    });
+    return NextResponse.json({ error: msg }, { status });
   }
 }

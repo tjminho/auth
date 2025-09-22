@@ -13,7 +13,7 @@ export async function POST(req: Request) {
         { error: "이메일이 필요합니다." },
         { status: 400 }
       );
-    const limit = hit(ip, email);
+    const limit = await hit(ip, email);
     if (limit.limited)
       return NextResponse.json(
         { error: "요청이 너무 많습니다. 잠시 후 다시 시도하세요." },

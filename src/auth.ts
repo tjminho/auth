@@ -8,16 +8,24 @@ import Credentials from "next-auth/providers/credentials";
 import { z } from "zod";
 import { compare } from "bcryptjs";
 import { createAndEmailVerificationToken } from "@/lib/verification";
-import { VerificationType } from "@prisma/client";
+import { Role, UserStatus, VerificationType } from "@prisma/client";
+import { hitLogin } from "@/lib/rate-limit";
+import { sessionCache } from "@/lib/cache";
+import { logger } from "@/lib/logger";
 
 const CredentialsSchema = z.object({
   email: z.string().email("이메일 형식이 다릅니다."),
-  password: z.string().min(8),
+  password: z.string().min(8).optional(),
+  tokenLogin: z.string().optional(),
 });
 
-export const { auth, signIn, signOut, handlers } = NextAuth({
+const isProd = process.env.NODE_ENV === "production";
+
+export const { handlers, signIn, signOut, auth } = NextAuth({
   adapter: PrismaAdapter(prisma),
-  session: { strategy: "database", maxAge: 60 * 60 * 2 },
+  session: { strategy: "jwt", maxAge: 60 * 60 * 2 },
+  trustHost: true,
+  secret: process.env.AUTH_SECRET,
 
   providers: [
     Google({
@@ -28,26 +36,70 @@ export const { auth, signIn, signOut, handlers } = NextAuth({
     Kakao({
       clientId: process.env.KAKAO_CLIENT_ID!,
       clientSecret: process.env.KAKAO_CLIENT_SECRET!,
+      authorization: { params: { scope: "account_email" } },
     }),
     Naver({
       clientId: process.env.NAVER_CLIENT_ID!,
       clientSecret: process.env.NAVER_CLIENT_SECRET!,
     }),
     Credentials({
-      async authorize(credentials) {
+      async authorize(credentials, req) {
         const parsed = CredentialsSchema.safeParse(credentials);
         if (!parsed.success) return null;
 
-        const { email, password } = parsed.data;
+        const { email, password, tokenLogin } = parsed.data;
+        const forwarded = req.headers.get("x-forwarded-for");
+        const ip =
+          forwarded?.split(",")[0]?.trim() ||
+          req.headers.get("x-real-ip") ||
+          "unknown";
+
+        const limit = await hitLogin(ip, email);
+        if (limit.limited) {
+          const minutes = Math.floor(limit.reset / 60);
+          const seconds = limit.reset % 60;
+          throw new Error(
+            `로그인 시도가 너무 많습니다. ${minutes > 0 ? `${minutes}분 ` : ""}${seconds}초 후 다시 시도해주세요.`
+          );
+        }
+
         const user = await prisma.user.findUnique({ where: { email } });
+        if (!user) return null;
 
-        // 보안: 상태/인증 여부는 내부 로깅만, 사용자에겐 동일 응답
-        if (!user?.password) return null;
-        if (user.status !== "ACTIVE") return null;
-        if (!user.emailVerified) return null;
+        if (tokenLogin === "1") {
+          if (user.status !== UserStatus.ACTIVE || !user.emailVerified)
+            return null;
+          const TEN_MIN = 10 * 60 * 1000;
+          if (
+            user.emailVerified &&
+            Date.now() - new Date(user.emailVerified).getTime() < TEN_MIN
+          ) {
+            return {
+              ...user,
+              subscriptionExpiresAt: user.subscriptionExpiresAt
+                ? new Date(user.subscriptionExpiresAt).toISOString()
+                : null,
+            } as any;
+          }
+          return null;
+        }
 
-        const ok = await compare(password, user.password);
-        return ok ? user : null;
+        if (
+          !user.password ||
+          user.status !== UserStatus.ACTIVE ||
+          !user.emailVerified
+        )
+          return null;
+
+        const ok = await compare(password!, user.password);
+        return ok
+          ? ({
+              ...user,
+              subscriptionExpiresAt: user.subscriptionExpiresAt
+                ? new Date(user.subscriptionExpiresAt).toISOString()
+                : null,
+            } as any)
+          : null;
       },
     }),
   ],
@@ -55,35 +107,81 @@ export const { auth, signIn, signOut, handlers } = NextAuth({
   callbacks: {
     async signIn({ user, account }) {
       try {
+        let dbUser: any = null;
+
+        // 1) 이메일 없는 OAuth 로그인 처리 (일부 제공자)
         if (!user?.email) {
-          // OAuth에서 이메일이 없으면 trustedEmail 입력 페이지로
-          return "/auth/set-email";
+          if (account?.provider && account?.providerAccountId) {
+            // 기존 Account가 고아 상태인지 확인
+            const existingAccount = await prisma.account.findUnique({
+              where: {
+                provider_providerAccountId: {
+                  provider: account.provider,
+                  providerAccountId: account.providerAccountId,
+                },
+              },
+            });
+            if (existingAccount) {
+              const linkedUser = await prisma.user.findUnique({
+                where: { id: existingAccount.userId },
+              });
+              if (!linkedUser) {
+                await prisma.account.delete({
+                  where: { id: existingAccount.id },
+                });
+              } else {
+                dbUser = linkedUser;
+              }
+            }
+          }
+
+          if (!dbUser) {
+            const tempEmail = `${account?.provider}-${account?.providerAccountId}@placeholder.local`;
+            dbUser = await prisma.user.create({
+              data: {
+                email: tempEmail,
+                status: UserStatus.PENDING,
+                role: Role.USER,
+              },
+            });
+          }
+
+          await prisma.account.upsert({
+            where: {
+              provider_providerAccountId: {
+                provider: account!.provider!,
+                providerAccountId: account!.providerAccountId!,
+              },
+            },
+            update: { userId: dbUser.id },
+            create: {
+              userId: dbUser.id,
+              type: account!.type || "oauth",
+              provider: account!.provider!,
+              providerAccountId: account!.providerAccountId!,
+            },
+          });
+
+          // userId를 쿼리로 넘기지 않고 페이지에서 세션 기반으로 식별
+          return `/auth/set-email`;
         }
 
-        let dbUser = await prisma.user.findUnique({
+        // 2) 이메일 있는 OAuth 로그인 처리
+        dbUser = await prisma.user.findUnique({
           where: { email: user.email },
         });
 
         if (!dbUser) {
           dbUser = await prisma.user.create({
             data: {
-              email: user.email,
+              email: user.email!,
               name: user.name || null,
-              status: "PENDING",
-              emailVerified: null,
-              accounts: account
-                ? {
-                    create: {
-                      type: account.type || "oauth",
-                      provider: account.provider,
-                      providerAccountId: account.providerAccountId,
-                    },
-                  }
-                : undefined,
+              status: UserStatus.PENDING,
+              role: Role.USER,
             },
           });
 
-          // 첫 OAuth 로그인 시 verification 레코드 생성
+          // 최초 OAuth 유입 마커(선택)
           await prisma.verification.create({
             data: {
               identifier: dbUser.email,
@@ -94,53 +192,127 @@ export const { auth, signIn, signOut, handlers } = NextAuth({
           });
         }
 
+        // Account <-> User 연결 보장
+        await prisma.account.upsert({
+          where: {
+            provider_providerAccountId: {
+              provider: account!.provider!,
+              providerAccountId: account!.providerAccountId!,
+            },
+          },
+          update: { userId: dbUser.id },
+          create: {
+            userId: dbUser.id,
+            type: account!.type || "oauth",
+            provider: account!.provider!,
+            providerAccountId: account!.providerAccountId!,
+          },
+        });
+
         const targetEmail = dbUser.trustedEmail ?? dbUser.email;
 
-        if (dbUser.status !== "ACTIVE" || !dbUser.emailVerified) {
+        // 이메일 미인증/비활성 사용자에게 검증 메일 발송
+        if (dbUser.status !== UserStatus.ACTIVE || !dbUser.emailVerified) {
           await createAndEmailVerificationToken(targetEmail);
           return `/auth/verify?email=${encodeURIComponent(targetEmail)}`;
         }
 
-        if (account?.provider && account?.providerAccountId) {
-          const existingAccount = await prisma.account.findUnique({
-            where: {
-              provider_providerAccountId: {
-                provider: account.provider,
-                providerAccountId: account.providerAccountId,
-              },
-            },
-          });
-
-          if (!existingAccount) {
-            await prisma.account.create({
-              data: {
-                userId: dbUser.id,
-                type: account.type || "oauth",
-                provider: account.provider,
-                providerAccountId: account.providerAccountId,
-              },
-            });
-          }
-        }
-
         return true;
       } catch (err) {
-        console.error("signIn error", err);
-        return "/auth/error"; // 보안: false 대신 에러 페이지로
+        logger.error("signIn error", err);
+        return "/auth/error";
       }
     },
 
-    async session({ session, user }) {
-      if (session.user) {
-        session.user.id = user.id;
-        session.user.role = (user as any).role;
-        session.user.status = (user as any).status;
-        session.user.unverified = !user.emailVerified;
+    async jwt({ token, user }) {
+      if (user) {
+        token.id = (user as any).id;
+        token.role = (user as any).role as Role | undefined;
+        token.status = (user as any).status as UserStatus | undefined;
+        token.email = (user as any).email ?? token.email;
+        token.unverified = !(user as any).emailVerified;
+        token.subscriptionExpiresAt =
+          (user as any).subscriptionExpiresAt ?? null;
+
+        if (token.id) {
+          await sessionCache.set(`session:user:${token.id}`, {
+            role: token.role,
+            status: token.status,
+            subscriptionExpiresAt: token.subscriptionExpiresAt ?? null,
+          });
+        }
       }
+
+      if (
+        !token.role ||
+        !token.status ||
+        token.subscriptionExpiresAt === undefined
+      ) {
+        if (token.id) {
+          const cached = await sessionCache.get<{
+            role: Role | undefined;
+            status: UserStatus | undefined;
+            subscriptionExpiresAt: string | null;
+          }>(`session:user:${token.id}`);
+
+          if (cached) {
+            token.role = cached.role;
+            token.status = cached.status;
+            token.subscriptionExpiresAt = cached.subscriptionExpiresAt;
+          } else {
+            const dbUser = await prisma.user.findUnique({
+              where: { id: token.id as string },
+              select: { role: true, status: true, subscriptionExpiresAt: true },
+            });
+
+            if (dbUser) {
+              token.role = dbUser.role;
+              token.status = dbUser.status;
+              token.subscriptionExpiresAt = dbUser.subscriptionExpiresAt
+                ? new Date(dbUser.subscriptionExpiresAt).toISOString()
+                : null;
+
+              await sessionCache.set(`session:user:${token.id}`, {
+                role: token.role,
+                status: token.status,
+                subscriptionExpiresAt: token.subscriptionExpiresAt ?? null,
+              });
+            }
+          }
+        }
+      }
+
+      // 구독 만료 처리
+      if (
+        token.role === Role.SUBSCRIBER &&
+        token.subscriptionExpiresAt &&
+        new Date(token.subscriptionExpiresAt) < new Date()
+      ) {
+        token.role = Role.USER;
+        token.subscriptionExpiresAt = null;
+        if (token.id) {
+          await sessionCache.set(`session:user:${token.id}`, {
+            role: token.role,
+            status: token.status,
+            subscriptionExpiresAt: token.subscriptionExpiresAt,
+          });
+        }
+      }
+      return token;
+    },
+
+    async session({ session, token }) {
+      if (!session.user) session.user = {} as any;
+      session.user.id = token.id as string;
+      session.user.role = token.role as any;
+      session.user.status = token.status as any;
+      session.user.unverified = token.unverified as boolean;
+      session.user.subscriptionExpiresAt = token.subscriptionExpiresAt ?? null;
       return session;
     },
 
     async redirect({ url, baseUrl }) {
+      if (url.includes("/auth/signin")) return baseUrl;
       if (url.startsWith("/")) return `${baseUrl}${url}`;
       if (url.startsWith(baseUrl)) return url;
       return baseUrl;
@@ -154,16 +326,15 @@ export const { auth, signIn, signOut, handlers } = NextAuth({
 
   cookies: {
     sessionToken: {
-      name: "__Secure-next-auth.session-token",
+      name: isProd
+        ? "__Secure-next-auth.session-token"
+        : "next-auth.session-token",
       options: {
         httpOnly: true,
-        sameSite: "strict",
-        secure: true,
+        sameSite: "lax",
+        secure: isProd,
         path: "/",
       },
     },
   },
-
-  trustHost: true,
-  secret: process.env.NEXTAUTH_SECRET,
 });

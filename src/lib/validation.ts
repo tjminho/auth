@@ -1,4 +1,3 @@
-// src/lib/validation.ts
 import { z } from "zod";
 
 export const passwordSchema = z
@@ -15,3 +14,5 @@ export const signupSchema = z.object({
   email: z.string().email("올바른 이메일 형식이 아닙니다."),
   password: passwordSchema,
 });
+
+export const emailSchema = z.string().email("올바른 이메일 형식이 아닙니다.");

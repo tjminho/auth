@@ -1,23 +1,38 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { signupSchema } from "@/lib/validation";
 import { z } from "zod";
 import { toast } from "sonner";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import Link from "next/link";
 import { Loader2, Eye, EyeOff } from "lucide-react";
 import { useRouter } from "next/navigation";
+import { useSession } from "next-auth/react";
 
 export default function SignupPage() {
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const router = useRouter();
+  const { data: session, status } = useSession();
+
+  // 로그인 상태면 홈으로 이동
+  useEffect(() => {
+    if (status === "authenticated") {
+      router.replace("/");
+    }
+  }, [status, router]);
 
   const form = useForm<z.infer<typeof signupSchema>>({
     resolver: zodResolver(signupSchema),
@@ -36,20 +51,31 @@ export default function SignupPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(values),
       });
-      const data = await res.json();
+
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        // JSON 파싱 실패 시
+      }
+
       if (!res.ok) {
         toast.error(data?.error || "회원가입 중 오류가 발생했습니다.");
         return;
       }
 
       toast.success("회원가입 완료! 이메일 인증 페이지로 이동합니다.");
-      // 가입 성공 시 인증 페이지로 이동, 이메일 쿼리 전달
       router.push(`/auth/verify?email=${encodeURIComponent(values.email)}`);
     } catch (e: any) {
       toast.error(e.message || "네트워크 오류가 발생했습니다.");
     } finally {
       setLoading(false);
     }
+  }
+
+  // 세션 로딩 중이면 아무것도 안 보여줌
+  if (status === "loading") {
+    return null;
   }
 
   return (
