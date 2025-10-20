@@ -1,5 +1,4 @@
 "use client";
-
 import { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -17,32 +16,45 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import Link from "next/link";
-import { Loader2, Eye, EyeOff } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { Loader2, Eye, EyeOff, AlertTriangle } from "lucide-react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useSession } from "next-auth/react";
-
+// ✅ 서버 응답 코드별 메시지 매핑
+const errorMessages: Record<string, string> = {
+  EMAIL_IN_USE: "이미 사용 중인 이메일입니다.",
+  INVALID_INPUT: "입력값이 올바르지 않습니다.",
+  RATE_LIMITED: "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+  SERVER_ERROR: "서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+  MAIL_SEND_FAILED: "가입은 완료되었지만 인증 메일 발송에 실패했습니다.",
+  default: "회원가입 중 오류가 발생했습니다.",
+};
 export default function SignupPage() {
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const router = useRouter();
-  const { data: session, status } = useSession();
-
+  const { status } = useSession();
+  const searchParams = useSearchParams();
+  // ✅ reason 파라미터 기반 경고 배너
+  const reason = searchParams.get("reason") ?? "";
+  const error = searchParams.get("error") ?? "";
+  const bannerMessage =
+    errorMessages[reason] || errorMessages[error] || errorMessages.default;
   // 로그인 상태면 홈으로 이동
   useEffect(() => {
     if (status === "authenticated") {
       router.replace("/");
     }
   }, [status, router]);
-
   const form = useForm<z.infer<typeof signupSchema>>({
     resolver: zodResolver(signupSchema),
     defaultValues: {
       name: "",
       email: "",
       password: "",
+      confirmPassword: "",
     },
   });
-
   async function onSubmit(values: z.infer<typeof signupSchema>) {
     setLoading(true);
     try {
@@ -51,35 +63,48 @@ export default function SignupPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(values),
       });
-
       let data: any = {};
       try {
         data = await res.json();
       } catch {
-        // JSON 파싱 실패 시
+        // JSON 파싱 실패 시 무시
       }
-
-      if (!res.ok) {
-        toast.error(data?.error || "회원가입 중 오류가 발생했습니다.");
+      if (!res.ok || !data?.success) {
+        const msg =
+          errorMessages[data?.error as keyof typeof errorMessages] ||
+          data?.message ||
+          errorMessages.default;
+        toast.error(msg);
+        if (data?.redirect) {
+          router.push(data.redirect);
+        }
         return;
       }
-
-      toast.success("회원가입 완료! 이메일 인증 페이지로 이동합니다.");
-      router.push(`/auth/verify?email=${encodeURIComponent(values.email)}`);
+      const targetEmail = data?.email || values.email;
+      toast.success(`${targetEmail} 주소로 인증 메일을 발송했습니다.`);
+      router.push(`/auth/verify?email=${encodeURIComponent(targetEmail)}`);
     } catch (e: any) {
       toast.error(e.message || "네트워크 오류가 발생했습니다.");
     } finally {
       setLoading(false);
     }
   }
-
   // 세션 로딩 중이면 아무것도 안 보여줌
   if (status === "loading") {
     return null;
   }
-
   return (
     <div className="mx-auto max-w-md">
+      {/* ✅ reason이 있으면 경고 배너 표시 */}
+      {reason && (
+        <div className="mb-4 bg-yellow-50 border border-yellow-300 p-3 rounded-md flex items-start gap-2">
+          <AlertTriangle className="h-5 w-5 text-yellow-600 mt-0.5" />
+          <div>
+            <p className="font-semibold text-yellow-800">회원가입 오류</p>
+            <p className="text-sm text-yellow-700">{bannerMessage}</p>
+          </div>
+        </div>
+      )}
       <Card>
         <CardHeader>
           <CardTitle>회원가입</CardTitle>
@@ -99,7 +124,6 @@ export default function SignupPage() {
                 </p>
               )}
             </div>
-
             {/* 이메일 */}
             <div className="space-y-2">
               <Label htmlFor="email">이메일</Label>
@@ -110,7 +134,6 @@ export default function SignupPage() {
                 </p>
               )}
             </div>
-
             {/* 비밀번호 */}
             <div className="space-y-2">
               <Label htmlFor="password">
@@ -140,14 +163,40 @@ export default function SignupPage() {
                 </p>
               )}
             </div>
-
+            {/* 비밀번호 확인 */}
+            <div className="space-y-2">
+              <Label htmlFor="confirmPassword">비밀번호 확인</Label>
+              <div className="relative">
+                <Input
+                  id="confirmPassword"
+                  type={showConfirmPassword ? "text" : "password"}
+                  {...form.register("confirmPassword")}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowConfirmPassword((prev) => !prev)}
+                  className="absolute inset-y-0 right-3 flex items-center text-gray-500 hover:text-gray-700"
+                  tabIndex={-1}
+                >
+                  {showConfirmPassword ? (
+                    <EyeOff size={18} />
+                  ) : (
+                    <Eye size={18} />
+                  )}
+                </button>
+              </div>
+              {form.formState.errors.confirmPassword && (
+                <p className="text-xs text-red-500" aria-live="polite">
+                  {form.formState.errors.confirmPassword.message}
+                </p>
+              )}
+            </div>
             {/* 제출 버튼 */}
             <Button type="submit" className="w-full" disabled={loading}>
               {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {loading ? "가입 중..." : "회원가입"}
             </Button>
           </form>
-
           {/* 로그인 링크 */}
           <p className="text-xs text-muted-foreground">
             이미 계정이 있으신가요?{" "}

@@ -5,21 +5,17 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import Link from "next/link";
-
 export default async function AdminPage() {
   const session = await auth();
   if (!session?.user) redirect("/auth/signin");
   if (session.user.role !== "ADMIN") redirect("/dashboard");
-
   const users = await prisma.user.findMany({
     orderBy: { createdAt: "desc" },
     take: 50,
   });
-
   const totalUsers = await prisma.user.count();
   const activeUsers = await prisma.user.count({ where: { status: "ACTIVE" } });
   const suspendedUsers = await prisma.user.count({ where: { status: "SUSPENDED" } });
-
   return (
     <div className="space-y-6">
       <Card>
@@ -33,7 +29,6 @@ export default async function AdminPage() {
           <Stat label="정지" value={suspendedUsers} />
         </CardContent>
       </Card>
-
       <Card>
         <CardHeader>
           <CardTitle>사용자 관리</CardTitle>
@@ -66,7 +61,6 @@ export default async function AdminPage() {
     </div>
   );
 }
-
 function Stat({ label, value }: { label: string; value: number }) {
   return (
     <div className="space-y-1">

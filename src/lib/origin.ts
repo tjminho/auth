@@ -7,7 +7,6 @@ export function isAllowedOrigin(req: Request) {
       process.env.NEXTAUTH_URL,
       process.env.NEXT_PUBLIC_APP_URL,
     ].filter(Boolean) as string[];
-
     return allowed.some((base) => {
       try {
         const b = new URL(base);

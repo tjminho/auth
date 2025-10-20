@@ -1,5 +1,4 @@
 import { Role, UserStatus } from "@prisma/client";
-
 declare module "next-auth" {
   interface User {
     id: string;
@@ -9,14 +8,15 @@ declare module "next-auth" {
     trustedEmail?: string | null;
     subscriptionExpiresAt?: string | null;
     name?: string | null;
+    userid?: string | null;
     email?: string | null;
+    lastProvider?: string | null;
+    emailVerified?: Date | null;
   }
-
   interface Session {
-    user: User;
+    user: User & DefaultSession["user"];
   }
 }
-
 declare module "next-auth/jwt" {
   interface JWT {
     id?: string;
@@ -27,5 +27,7 @@ declare module "next-auth/jwt" {
     status?: UserStatus;
     unverified?: boolean;
     subscriptionExpiresAt?: string | null;
+    lastProvider?: string | null;
+    emailVerified?: Date | null; // ✅ 추가
   }
 }

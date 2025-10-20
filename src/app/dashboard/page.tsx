@@ -3,14 +3,11 @@ import { redirect } from "next/navigation";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { SignOutButton } from "@/components/auth/signout-button";
-
 export default async function DashboardPage() {
   const session = await auth();
-
   if (!session?.user) {
     redirect("/auth/signin");
   }
-
   return (
     <div className="grid gap-6 md:grid-cols-2">
       {/* 내 정보 카드 */}
@@ -34,7 +31,6 @@ export default async function DashboardPage() {
           <SignOutButton />
         </CardContent>
       </Card>
-
       {/* 예시 데이터 카드 */}
       <Card>
         <CardHeader>

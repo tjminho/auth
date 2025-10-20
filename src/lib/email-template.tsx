@@ -1,5 +1,4 @@
 import * as React from "react";
-
 export function VerifyEmailTemplate({ verifyUrl }: { verifyUrl: string }) {
   return (
     <div
@@ -14,11 +13,9 @@ export function VerifyEmailTemplate({ verifyUrl }: { verifyUrl: string }) {
       <h2 style={{ color: "#111111", fontSize: "20px", marginBottom: "12px" }}>
         이메일 인증 안내
       </h2>
-
       <p style={{ marginBottom: "16px" }}>
         아래 버튼을 클릭하여 이메일 인증을 완료해주세요.
       </p>
-
       <a
         href={verifyUrl}
         style={{
@@ -33,7 +30,6 @@ export function VerifyEmailTemplate({ verifyUrl }: { verifyUrl: string }) {
       >
         이메일 인증하기
       </a>
-
       <p style={{ fontSize: "12px", color: "#666666", marginTop: "24px" }}>
         이 메일은 회원가입 요청에 따라 발송되었습니다. 본인이 요청하지 않았다면
         이 메일을 무시하셔도 됩니다.

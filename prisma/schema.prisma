@@ -10,27 +10,33 @@ datasource db {
 model User {
   id                     String          @id @default(uuid())
   name                   String?
-  email                  String          @unique // provider 이메일
-  trustedEmail           String?         @unique // 사용자가 직접 입력한 신뢰 이메일
+  email                  String?         @unique // provider에서 받은 이메일 (인증 여부 불문)
+  trustedEmail           String?         @unique // 인증 완료된 이메일만 저장
   emailVerified          DateTime? // trustedEmail 인증 완료 시각
   lastVerificationSentAt DateTime? // 마지막 인증 메일 발송 시각
-  provider               String?
+  provider               String? // 최초 가입 시 사용한 provider
   password               String?         @db.VarChar(255)
   image                  String?
+  unverified             Boolean         @default(false)
   createdAt              DateTime        @default(now())
   updatedAt              DateTime        @updatedAt
   role                   Role            @default(USER)
   status                 UserStatus      @default(ACTIVE)
   subscriptionExpiresAt  DateTime? // 구독 만료일 (SUBSCRIBER용)
+  lastProvider           String? // 마지막 로그인에 사용된 provider
+  fcmToken               String?
   mfaEnabled             Boolean         @default(false)
   mfaSecret              String?         @db.VarChar(255)
   mfaVerifiedAt          DateTime?
+  deletedAt              DateTime? // soft-delete 용도
   accounts               Account[]
   sessions               Session[]
   verifiedEmails         VerifiedEmail[]
   companies              Company[]       @relation("UserCompanies")
+  Company                Company[]
 
-  // @unique로 이미 인덱스가 생성되므로 @@index 제거
+  @@unique([provider, email]) // provider+email 조합으로 unique
+  @@index([status])
 }
 
 model Account {
@@ -68,40 +74,51 @@ model Session {
 
 model Verification {
   id         String           @id @default(uuid())
-  identifier String           @db.VarChar(255) // trustedEmail 또는 사용자 ID
-  value      String // 토큰 값
+  identifier String           @db.VarChar(255) // 이메일 또는 사용자 ID
+  userId     String
+  value      String
   type       VerificationType
   expiresAt  DateTime
-  consumedAt DateTime? // 사용 완료 시각
+  consumedAt DateTime?
   createdAt  DateTime         @default(now())
 
-  @@unique([identifier, type])
-  @@index([value])
+  // consumedAt이 NULL일 때만 unique 보장 필요 → migration에서 partial index 고려
   @@index([identifier])
+  @@index([value])
 }
 
 model VerifiedEmail {
   id         String   @id @default(uuid())
-  email      String   @unique
+  email      String
   userId     String
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   verifiedAt DateTime @default(now())
   ipAddress  String?
   userAgent  String?
 
+  @@unique([userId, email]) // 한 유저가 동일 이메일을 중복 인증 불가
   @@index([userId])
 }
 
 model Company {
-  id         String   @id @default(uuid())
-  name       String
-  subdomain  String   @unique
-  adminEmail String
-  createdAt  DateTime @default(now())
-  createdBy  String
-  creator    User     @relation("UserCompanies", fields: [createdBy], references: [id])
+  id        String   @id @default(uuid())
+  name      String
+  subdomain String   @unique
+  adminId   String // User와 관계로 변경
+  createdAt DateTime @default(now())
+  createdBy String
+  creator   User     @relation("UserCompanies", fields: [createdBy], references: [id])
+  admin     User     @relation(fields: [adminId], references: [id])
 
   @@index([createdBy])
+  @@index([adminId])
+}
+
+model VerificationSession {
+  vid       String   @id
+  userId    String // User.id 타입에 맞게 (Int라면 Int로)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
 }
 
 enum VerificationType {
@@ -114,6 +131,7 @@ enum Role {
   SUBSCRIBER // 유료 구독자
   MODERATOR // 커뮤니티 관리자
   ADMIN // 시스템 관리자
+  SUPER_ADMIN // 최고 관리자 (관리자 부여/회수 권한)
 }
 
 enum UserStatus {
@@ -121,4 +139,23 @@ enum UserStatus {
   SUSPENDED
   DELETED
   PENDING
+  BLOCKED // 관리자 차단
+}
+
+model Term {
+  id         Int     @id @default(autoincrement())
+  name       String
+  category   String
+  definition String
+  example    String?
+
+  guides Guide[] @relation("GuideTerms")
+}
+
+model Guide {
+  id    Int    @id @default(autoincrement())
+  title String
+  steps String // Markdown 형식으로 저장
+
+  relatedTerms Term[] @relation("GuideTerms")
 }
