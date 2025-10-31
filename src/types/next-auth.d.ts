@@ -1,17 +1,17 @@
 import { Role, UserStatus } from "@prisma/client";
+import { DefaultSession } from "next-auth";
 declare module "next-auth" {
   interface User {
     id: string;
-    role?: Role | null; // Prisma enum 타입으로 변경
-    status?: UserStatus | null; // Prisma enum 타입으로 변경
+    role?: Role | null;
+    status?: UserStatus | null;
     unverified?: boolean | null;
     trustedEmail?: string | null;
-    subscriptionExpiresAt?: string | null;
+    subscriptionExpiresAt?: Date | null; // ✅ 세션/유저에서는 Date
     name?: string | null;
-    userid?: string | null;
     email?: string | null;
     lastProvider?: string | null;
-    emailVerified?: Date | null;
+    emailVerified?: Date | null; // ✅ 세션/유저에서는 Date
   }
   interface Session {
     user: User & DefaultSession["user"];
@@ -23,11 +23,11 @@ declare module "next-auth/jwt" {
     email?: string | null;
     name?: string | null;
     trustedEmail?: string | null;
-    role?: Role;
-    status?: UserStatus;
+    role?: Role | null;
+    status?: UserStatus | null;
     unverified?: boolean;
-    subscriptionExpiresAt?: string | null;
+    subscriptionExpiresAt?: string | null; // ✅ JWT에는 string (ISO)
     lastProvider?: string | null;
-    emailVerified?: Date | null; // ✅ 추가
+    emailVerified?: string | null; // ✅ JWT에는 string (ISO)
   }
 }

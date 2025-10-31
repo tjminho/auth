@@ -24,16 +24,17 @@ model User {
   status                 UserStatus      @default(ACTIVE)
   subscriptionExpiresAt  DateTime? // 구독 만료일 (SUBSCRIBER용)
   lastProvider           String? // 마지막 로그인에 사용된 provider
-  fcmToken               String?
   mfaEnabled             Boolean         @default(false)
   mfaSecret              String?         @db.VarChar(255)
   mfaVerifiedAt          DateTime?
   deletedAt              DateTime? // soft-delete 용도
+  fcmTokens              FcmToken[]
   accounts               Account[]
   sessions               Session[]
   verifiedEmails         VerifiedEmail[]
   companies              Company[]       @relation("UserCompanies")
   Company                Company[]
+  loginHistory           LoginHistory[]
 
   @@unique([provider, email]) // provider+email 조합으로 unique
   @@index([status])
@@ -121,6 +122,35 @@ model VerificationSession {
   createdAt DateTime @default(now())
 }
 
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  email     String
+  token     String   @unique
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+model LoginHistory {
+  id        String   @id @default(uuid())
+  userId    String
+  provider  String
+  ip        String
+  userAgent String
+  location  String? // GeoIP 결과
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model FcmToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  createdAt DateTime @default(now())
+}
+
 enum VerificationType {
   EMAIL
   PASSWORD_RESET
@@ -140,22 +170,4 @@ enum UserStatus {
   DELETED
   PENDING
   BLOCKED // 관리자 차단
-}
-
-model Term {
-  id         Int     @id @default(autoincrement())
-  name       String
-  category   String
-  definition String
-  example    String?
-
-  guides Guide[] @relation("GuideTerms")
-}
-
-model Guide {
-  id    Int    @id @default(autoincrement())
-  title String
-  steps String // Markdown 형식으로 저장
-
-  relatedTerms Term[] @relation("GuideTerms")
 }

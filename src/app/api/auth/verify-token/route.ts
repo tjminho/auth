@@ -1,121 +1,123 @@
-// src/app/api/auth/verify-token/route.ts
 import { NextResponse } from "next/server";
 import { verifyEmailByValueToken } from "@/lib/verification";
 import { logger } from "@/lib/logger";
-import { notifyVerified } from "@/server/ws";
 import { sendFCM } from "@/lib/fcm";
+
+// ✅ 이메일 마스킹 유틸
+function maskEmail(email: string) {
+  if (!email) return "";
+  const [local, domain] = email.split("@");
+  if (!domain) return email;
+  return local.slice(0, 3) + "***@" + domain;
+}
 
 export async function POST(req: Request) {
   try {
-    const {
-      token,
-      vid,
-      email: emailParam,
-    } = await req.json().catch(() => ({}));
+    const body = await req.json().catch(() => ({}));
+    const token = typeof body.token === "string" ? body.token.trim() : "";
+    const vidFromBody = typeof body.vid === "string" ? body.vid.trim() : null;
+    const emailParam =
+      typeof body.email === "string" ? body.email.trim().toLowerCase() : null;
 
-    // ✅ 토큰 유효성 검사
-    if (!token || typeof token !== "string") {
+    if (!token) {
+      logger.warn("이메일 인증 실패: 토큰 누락", {
+        ip: req.headers.get("x-forwarded-for"),
+      });
       return NextResponse.json(
         {
           success: false,
           code: "TOKEN_MISSING",
-          message: "토큰 누락",
-          session: "unchanged",
+          message: "토큰이 누락되었습니다.",
         },
         { status: 400 }
       );
     }
 
-    // ✅ 클라이언트 정보 (로그용)
     const ip =
       req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "0.0.0.0";
     const ua = req.headers.get("user-agent") ?? undefined;
 
-    // ✅ 토큰 검증 (DB 조회 + 만료 확인)
+    // ✅ 토큰 검증
     const result = await verifyEmailByValueToken(token, { ip, ua });
     if (!result) {
-      logger.warn("이메일 인증 실패: 내부 오류", {
+      logger.warn("이메일 인증 실패: 토큰 검증 실패", {
         token: token.slice(0, 6) + "...",
         ip,
         ua,
-        providedEmail: emailParam,
       });
       return NextResponse.json(
         {
           success: false,
           code: "TOKEN_INVALID",
-          message: "토큰 검증 실패",
-          session: "unchanged",
+          message: "토큰 검증에 실패했습니다.",
         },
         { status: 400 }
       );
     }
 
-    const { email, code } = result;
+    const { email, code, vs, userId } = result;
 
-    // ✅ 실패 코드 처리
     if (code !== "VERIFIED") {
       logger.warn("이메일 인증 실패", {
         code,
-        email,
+        email: maskEmail(email ?? ""),
         ip,
         ua,
-        providedEmail: emailParam,
       });
-
-      let message = "인증 처리에 실패했습니다.";
-      if (code === "EXPIRED") message = "만료된 인증 링크입니다.";
-      else if (code === "ALREADY_USED")
-        message = "이미 사용된 인증 링크입니다.";
-      else if (code === "EMAIL_MISMATCH")
-        message = "토큰과 이메일이 일치하지 않습니다.";
-      else if (code === "USER_NOT_FOUND")
-        message = "해당 유저를 찾을 수 없습니다.";
-      else if (code === "INVALID_SIGNATURE") message = "잘못된 토큰입니다.";
-
       return NextResponse.json(
-        { success: false, code, message, email, session: "unchanged" },
+        { success: false, code, message: "인증 처리에 실패했습니다.", email },
         { status: 400 }
       );
     }
 
     // ✅ 이메일 매칭 추가 검증
-    if (emailParam && emailParam.toLowerCase() !== email.toLowerCase()) {
-      logger.warn("이메일 불일치", { email, emailParam, ip });
+    if (emailParam && emailParam !== (email ?? "").toLowerCase()) {
+      logger.warn("이메일 불일치", {
+        expected: emailParam,
+        actual: maskEmail(email ?? ""),
+        ip,
+      });
       return NextResponse.json(
         {
           success: false,
           code: "EMAIL_MISMATCH",
           message: "토큰과 이메일이 일치하지 않습니다.",
-          session: "unchanged",
         },
         { status: 400 }
       );
     }
 
-    // ✅ 인증 성공 처리
-    logger.info("이메일 인증 성공", { email, ip, ua, vid: vid ?? null });
-
-    // 관리자 FCM 알림
-    await sendFCM({
-      title: "이메일 인증 완료",
-      body: `사용자 ${email}가 인증을 완료했습니다.`,
-      topic: "admin-alerts",
+    // ✅ 인증 성공 로그
+    logger.info("이메일 인증 성공", {
+      userId,
+      email: maskEmail(email ?? ""),
+      ip,
+      ua,
+      vid: vidFromBody ?? vs ?? null,
     });
 
-    // WebSocket 알림 (브라우저 자동 반응)
-    if (vid) {
-      await notifyVerified(vid, email);
+    // 관리자 FCM 알림
+    try {
+      await sendFCM({
+        title: "이메일 인증 완료",
+        body: `사용자 ${maskEmail(email ?? "")}가 인증을 완료했습니다.`,
+        topic: "admin-alerts",
+      });
+    } catch (err: any) {
+      logger.warn("FCM 알림 실패", {
+        email: maskEmail(email ?? ""),
+        error: err?.message,
+      });
     }
 
-    // ✅ 최종 응답
+    // ✅ 여기서는 notifyVerified 호출하지 않음
     return NextResponse.json(
       {
         success: true,
         code: "VERIFIED",
-        message: "이메일 인증 완료",
+        message: "이메일 인증이 완료되었습니다.",
         email,
-        session: "updated", // 클라이언트에서 useSession().update() 호출 유도
+        vid: vidFromBody ?? vs ?? null, // 프론트에서 사용
       },
       { status: 200 }
     );
@@ -128,8 +130,7 @@ export async function POST(req: Request) {
       {
         success: false,
         code: "SERVER_ERROR",
-        message: e?.message ?? "서버 오류",
-        session: "unchanged",
+        message: "서버 오류가 발생했습니다.",
       },
       { status: 500 }
     );
