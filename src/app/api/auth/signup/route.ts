@@ -6,10 +6,12 @@ import { createAndEmailVerificationToken } from "@/lib/verification";
 import { UserStatus } from "@prisma/client";
 import { hit } from "@/lib/rate-limit";
 import { logger } from "@/lib/logger";
-import { createVerificationId } from "@/server/ws"; // ✅ WS용 vid 생성 함수
+import { randomUUID } from "crypto"; // ✅ SSE용 vid 생성
+
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
+
     // 1. 입력값 검증
     const parsed = signupSchema.safeParse(body);
     if (!parsed.success) {
@@ -17,6 +19,7 @@ export async function POST(req: Request) {
         parsed.error.flatten().formErrors[0] ??
         Object.values(parsed.error.flatten().fieldErrors)[0]?.[0] ??
         "잘못된 입력값입니다.";
+
       return NextResponse.json(
         {
           success: false,
@@ -27,14 +30,17 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
+
     // ✅ 이메일 전처리
     const email = parsed.data.email.trim().toLowerCase();
     const password = parsed.data.password;
     const name = parsed.data.name?.trim();
+
     // 2. 요청 제한
     const ipHeader = req.headers.get("x-forwarded-for") ?? "";
     const ip = ipHeader.split(",")[0].trim() || "unknown";
     const ua = req.headers.get("user-agent") ?? undefined;
+
     const limit = await hit(ip, email);
     if (limit.limited) {
       logger.warn("회원가입 요청 제한 초과", {
@@ -54,10 +60,12 @@ export async function POST(req: Request) {
         { status: 429 }
       );
     }
+
     // 3. 이메일 중복 체크
     const existing = await prisma.user.findFirst({
       where: { OR: [{ trustedEmail: email }, { email }] },
     });
+
     if (existing) {
       if (!existing.emailVerified || existing.status === UserStatus.PENDING) {
         return NextResponse.json(
@@ -83,8 +91,10 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
+
     // 4. 비밀번호 해시
     const hashedPassword = await hash(password, 12);
+
     // 5. 사용자 생성
     let newUser;
     try {
@@ -115,13 +125,24 @@ export async function POST(req: Request) {
       logger.error("회원가입 DB 오류", { error: dbError?.message });
       throw dbError;
     }
+
     // 6. VerificationSession 생성 + 인증 메일 발송
     let vid: string | null = null;
     try {
-      // ✅ WebSocket 검증용 vid 생성 (한 번만)
-      vid = await createVerificationId(newUser.id);
+      // ✅ SSE용 vid 생성 (UUID)
+      vid = randomUUID();
+
+      await prisma.verificationSession.create({
+        data: {
+          userId: newUser.id,
+          vid,
+          createdAt: new Date(),
+        },
+      });
+
       // ✅ vid를 메일 발송 함수에 전달
       await createAndEmailVerificationToken(newUser, email, { ip, ua, vid });
+
       logger.info("회원가입 인증 메일 발송 성공", {
         email: maskEmail(email),
         ip,
@@ -144,6 +165,7 @@ export async function POST(req: Request) {
         { status: 500 }
       );
     }
+
     return NextResponse.json({
       success: true,
       message: "가입 완료. 이메일 인증을 진행해주세요.",
@@ -167,6 +189,7 @@ export async function POST(req: Request) {
     );
   }
 }
+
 // ✅ 이메일 로그 마스킹 유틸
 function maskEmail(email: string) {
   const [local, domain] = email.split("@");

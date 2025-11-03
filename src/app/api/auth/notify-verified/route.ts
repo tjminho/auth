@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
-import { notifyVerified } from "@/server/ws";
 import { logger } from "@/lib/logger";
-import { prisma } from "@/lib/prisma"; // 세션 삭제 지연용
+import { prisma } from "@/lib/prisma";
 
 // ✅ 이메일 마스킹 유틸
 function maskEmail(email: string) {
@@ -67,68 +66,33 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ notifyVerified 호출 (재시도 포함)
-    let delivered = false;
-    try {
-      delivered = await notifyVerified(vid, email, {
-        retries: 5, // 최대 5회 재시도
-        delayMs: 2000, // 2초 간격
-      });
-    } catch (err: any) {
-      logger.error("notify-verified 내부 오류", {
+    // ✅ SSE 방식: DB 상태 업데이트 (verifiedAt 기록)
+    const updated = await prisma.verificationSession.updateMany({
+      where: { vid, user: { email } },
+      data: { verifiedAt: new Date() },
+    });
+
+    if (updated.count === 0) {
+      logger.warn("notify-verified 실패: 세션 없음", {
         vid,
         email: maskEmail(email),
-        message: err?.message,
       });
       return NextResponse.json(
         {
           success: false,
-          code: "NOTIFY_ERROR",
-          message: "알림 전송 중 오류가 발생했습니다.",
-        },
-        { status: 500 }
-      );
-    }
-
-    // ✅ 실패 처리 (grace period 후 세션 삭제)
-    if (!delivered) {
-      logger.warn("notify-verified 최종 실패: 연결 없음", {
-        vid,
-        email: maskEmail(email),
-      });
-
-      setTimeout(async () => {
-        try {
-          await prisma.verificationSession.deleteMany({ where: { vid } });
-          logger.info("만료된 VerificationSession 정리 완료", { vid });
-        } catch (err: any) {
-          logger.error("VerificationSession 정리 실패", {
-            vid,
-            message: err?.message,
-          });
-        }
-      }, 30_000);
-
-      return NextResponse.json(
-        {
-          success: false,
-          code: "NO_CONNECTION",
-          message: "해당 vid로 연결된 클라이언트가 없습니다.",
+          code: "NO_SESSION",
+          message: "해당 vid 세션을 찾을 수 없습니다.",
         },
         { status: 404 }
       );
     }
 
     // ✅ 성공 처리
-    logger.info("notify-verified 성공", {
-      vid,
-      email: maskEmail(email),
-    });
-
+    logger.info("notify-verified 성공", { vid, email: maskEmail(email) });
     return NextResponse.json({
       success: true,
       code: "NOTIFIED",
-      message: "알림 전송 성공",
+      message: "인증 완료 처리됨",
     });
   } catch (e: any) {
     logger.error("notify-verified API 서버 오류", {

@@ -5,7 +5,6 @@ import { hit } from "@/lib/rate-limit";
 import { logger } from "@/lib/logger";
 import { auth } from "@/auth";
 import { User } from "@prisma/client";
-import { createVerificationId } from "@/server/ws";
 
 function isRealEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim().toLowerCase());
@@ -152,8 +151,12 @@ export async function POST(req: Request) {
 
     // ✅ 인증 메일 발송
     try {
-      const vid = await createVerificationId(user.id);
-      await createAndEmailVerificationToken(user, targetEmail, { ip, ua, vid });
+      // createAndEmailVerificationToken 내부에서 VerificationSession 생성 및 vid 반환
+      const { token, vid } = await createAndEmailVerificationToken(
+        user,
+        targetEmail,
+        { ip, ua }
+      );
 
       logger.info("인증 메일 발송 성공", {
         userId: user.id,
@@ -182,53 +185,16 @@ export async function POST(req: Request) {
         ua,
         error: msg,
       });
-
-      switch (msg) {
-        case "RATE_LIMITED":
-          return NextResponse.json(
-            {
-              success: false,
-              sent: false,
-              session: "unchanged",
-              code: "RATE_LIMITED",
-              message: "잠시 후 다시 시도해주세요.",
-            },
-            { status: 429 }
-          );
-        case "DAILY_LIMIT_EXCEEDED":
-          return NextResponse.json(
-            {
-              success: false,
-              sent: false,
-              session: "unchanged",
-              code: "DAILY_LIMIT_EXCEEDED",
-              message: "오늘은 더 이상 인증 메일을 보낼 수 없습니다.",
-            },
-            { status: 429 }
-          );
-        case "RESEND_FAILED":
-          return NextResponse.json(
-            {
-              success: false,
-              sent: false,
-              session: "unchanged",
-              code: "RESEND_FAILED",
-              message: "메일 발송에 실패했습니다.",
-            },
-            { status: 500 }
-          );
-        default:
-          return NextResponse.json(
-            {
-              success: false,
-              sent: false,
-              session: "unchanged",
-              code: "SERVER_ERROR",
-              message: msg || "서버 오류",
-            },
-            { status: 500 }
-          );
-      }
+      return NextResponse.json(
+        {
+          success: false,
+          sent: false,
+          session: "unchanged",
+          code: "SERVER_ERROR",
+          message: msg || "서버 오류",
+        },
+        { status: 500 }
+      );
     }
   } catch (e: any) {
     logger.error("인증 메일 발송 처리 중 서버 오류", {

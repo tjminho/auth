@@ -75,19 +75,7 @@ export default function TokenBridgePage() {
             );
           }
 
-          // ✅ 이제 WebSocket 알림 API 호출
-          if (targetVid) {
-            try {
-              await fetch("/api/auth/notify-verified", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ vid: targetVid, email: emailParam }),
-              });
-            } catch (err) {
-              console.error("notifyVerified API 호출 실패", err);
-            }
-          }
-
+          // ✅ SSE 기반: DB 업데이트만으로 충분 → notify-verified 호출 제거
           startCountdownAndClose(3000);
         } else {
           toast.error(data?.message || "인증 처리에 실패했습니다.");

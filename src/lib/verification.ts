@@ -50,21 +50,20 @@ class VerifyError extends Error {
 
 // ===== 토큰 페이로드 =====
 type SignedPayload = {
-  vid: string;
+  vid: string; // VerificationSession.vid
   uid: string;
   exp: number;
   ip?: string;
   ua?: string;
   st?: string;
-  vs?: string;
 };
 
 // ===== 검증 결과 타입 =====
 export type VerifyResult = {
   email: string;
   code: VerifyErrorCode;
-  vs?: string;
   userId?: string;
+  vid?: string;
 };
 
 // ===== 유틸 =====
@@ -80,7 +79,7 @@ function fromB64url(input: string): string {
   while (input.length % 4) input += "=";
   return Buffer.from(input, "base64").toString();
 }
-function sign(payload: SignedPayload): string {
+function sign(payload: any): string {
   const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const body = b64url(JSON.stringify(payload));
   const data = `${header}.${body}`;
@@ -93,7 +92,7 @@ function sign(payload: SignedPayload): string {
     .replace(/\//g, "_");
   return `${data}.${sig}`;
 }
-function verify(token: string): SignedPayload | null {
+function verify(token: string): any | null {
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [header, body, sig] = parts;
@@ -178,8 +177,8 @@ async function assertResendAllowed(
 export async function createAndEmailVerificationToken(
   user: User,
   targetEmailRaw: string,
-  meta?: { ip?: string; ua?: string; signupToken?: string; vid?: string }
-): Promise<{ token: string } | never> {
+  meta?: { ip?: string; ua?: string; signupToken?: string }
+): Promise<{ token: string; vid: string }> {
   if (!user?.id) throw new VerifyError("USER_ID_REQUIRED");
 
   const targetEmail = normalizeEmail(targetEmailRaw);
@@ -201,7 +200,9 @@ export async function createAndEmailVerificationToken(
 
   const expiresAt = addMinutes(new Date(), TTL_MIN);
 
-  const verification = await prisma.$transaction(async (tx) => {
+  // ✅ Verification + VerificationSession 함께 생성
+  const { verification, session } = await prisma.$transaction(async (tx) => {
+    // 1. 기존 Verification 무효화
     await tx.verification.updateMany({
       where: {
         userId: user.id,
@@ -210,7 +211,17 @@ export async function createAndEmailVerificationToken(
       },
       data: { consumedAt: new Date() },
     });
-    return tx.verification.create({
+
+    // 2. 기존 VerificationSession 정리 (아직 인증 안 된 세션 제거)
+    await tx.verificationSession.deleteMany({
+      where: {
+        userId: user.id,
+        verifiedAt: null,
+      },
+    });
+
+    // 3. 새 Verification 생성
+    const verification = await tx.verification.create({
       data: {
         identifier: targetEmail,
         userId: user.id,
@@ -219,24 +230,32 @@ export async function createAndEmailVerificationToken(
         expiresAt,
       },
     });
+
+    // 4. 새 VerificationSession 생성
+    const session = await tx.verificationSession.create({
+      data: {
+        userId: user.id,
+        expiresAt,
+      },
+    });
+
+    return { verification, session };
   });
 
-  const payload: SignedPayload = {
-    vid: verification.id,
+  const payload = {
+    vid: session.vid, // ✅ VerificationSession.vid 사용
     uid: user.id,
     exp: Math.floor(expiresAt.getTime() / 1000),
     ip: meta?.ip ? hash(meta.ip) : undefined,
     ua: meta?.ua ? hash(meta.ua) : undefined,
     st: meta?.signupToken ? hash(meta.signupToken) : undefined,
-    vs: meta?.vid, // WebSocket 세션 식별자
   };
   const signed = sign(payload);
 
-  // 링크 생성
   const query = new URLSearchParams({
     email: targetEmail,
     token: signed,
-    vid: meta?.vid ?? "",
+    vid: session.vid, // ✅ 메일 링크에도 session.vid
   });
   const verifyUrl = `${APP_URL}/auth/token-bridge?${query.toString()}`;
 
@@ -248,7 +267,6 @@ export async function createAndEmailVerificationToken(
       react: VerifyEmailTemplate({ verifyUrl }),
     });
   } catch (err: any) {
-    // 발송 실패 시 토큰 무효화
     await prisma.verification.update({
       where: { id: verification.id },
       data: { consumedAt: new Date() },
@@ -262,7 +280,6 @@ export async function createAndEmailVerificationToken(
     throw new VerifyError("RESEND_FAILED");
   }
 
-  // 쿨다운 갱신
   await prisma.user.update({
     where: { id: user.id },
     data: { lastVerificationSentAt: new Date() },
@@ -276,9 +293,8 @@ export async function createAndEmailVerificationToken(
     signupToken: meta?.signupToken ? "***" : undefined,
   });
 
-  return { token: signed };
+  return { token: signed, vid: session.vid }; // ✅ session.vid도 함께 반환
 }
-
 export async function verifyEmailByValueToken(
   token: string,
   opts?: { ip?: string; ua?: string; signupToken?: string }
@@ -288,18 +304,15 @@ export async function verifyEmailByValueToken(
     if (!payload) return { email: "", code: "INVALID_SIGNATURE" };
     if (payload.exp * 1000 < Date.now()) return { email: "", code: "EXPIRED" };
 
-    const verification = await prisma.verification.findUnique({
-      where: { id: payload.vid },
+    const verification = await prisma.verification.findFirst({
+      where: { userId: payload.uid, type: VerificationType.EMAIL },
+      orderBy: { createdAt: "desc" },
     });
-    if (!verification || verification.type !== VerificationType.EMAIL) {
-      return { email: "", code: "NOT_FOUND" };
-    }
-    if (verification.consumedAt) {
+    if (!verification) return { email: "", code: "NOT_FOUND" };
+    if (verification.consumedAt)
       return { email: verification.identifier, code: "ALREADY_USED" };
-    }
-    if (verification.expiresAt < new Date()) {
+    if (verification.expiresAt < new Date())
       return { email: verification.identifier, code: "EXPIRED" };
-    }
 
     // IP/UA 바인딩 검증
     if (payload.ip && payload.ip !== hash(opts?.ip || "")) {
@@ -324,6 +337,7 @@ export async function verifyEmailByValueToken(
       return { email: verification.identifier, code: "EMAIL_MISMATCH" };
     }
 
+    // ✅ DB 업데이트
     await prisma.$transaction(async (tx) => {
       await tx.user.update({
         where: { id: user.id },
@@ -339,6 +353,10 @@ export async function verifyEmailByValueToken(
         where: { id: verification.id },
         data: { consumedAt: new Date() },
       });
+      await tx.verificationSession.updateMany({
+        where: { vid: payload.vid },
+        data: { verifiedAt: new Date() },
+      });
     });
 
     logger.info("이메일 인증 성공", {
@@ -346,23 +364,13 @@ export async function verifyEmailByValueToken(
       userId: user.id,
       ip: opts?.ip,
       ua: opts?.ua,
-      vid: payload.vs || "",
     });
-
-    // ✅ WebSocket 알림
-    if (payload.vs) {
-      try {
-        await notifyVerified(payload.vs, user.email ?? "");
-      } catch (e: any) {
-        logger.warn("WS 알림 실패", { vs: payload.vs, message: e?.message });
-      }
-    }
 
     return {
       email: normalizedIdentifier,
       code: "VERIFIED",
-      vs: payload.vs,
       userId: user.id,
+      vid: payload.vid,
     };
   } catch (err: any) {
     logger.error("이메일 인증 처리 중 오류", {

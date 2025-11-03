@@ -2,16 +2,13 @@
   "name": "mzmon",
   "version": "0.1.0",
   "private": true,
-  "scripts": {
-    "lint": "next lint",
-    "dev": "concurrently \"next dev --turbopack\" \"ts-node-dev -r tsconfig-paths/register -P tsconfig.server.json server.ts\"",
-    "ws": "ts-node-dev -r tsconfig-paths/register -P tsconfig.server.json server.ts",
-    "build": "next build && pnpm run build:ws",
-    "build:ws": "tsc -p tsconfig.server.json",
-    "start": "concurrently \"next start\" \"pnpm run start:ws\"",
-    "start:ws": "node dist/server.js",
-    "clean": "rimraf .next dist"
-  },
+"scripts": {
+  "lint": "next lint",
+  "dev": "next dev --turbopack",
+  "build": "next build",
+  "start": "next start",
+  "clean": "rimraf .next dist"
+},
   "dependencies": {
     "@auth/prisma-adapter": "^2.10.0",
     "@hookform/resolvers": "^5.2.2",
