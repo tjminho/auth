@@ -20,7 +20,7 @@ export async function POST(req: Request) {
     const email = parsed.data.email.trim().toLowerCase();
 
     // ✅ 유저 존재 여부 확인
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await prisma.user.findFirst({ where: { email } });
 
     // ✅ 보안상 존재하지 않는 이메일도 동일 응답
     if (!user) {

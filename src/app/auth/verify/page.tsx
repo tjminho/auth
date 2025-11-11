@@ -1,4 +1,5 @@
 "use client";
+
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
@@ -64,44 +65,54 @@ export default function VerifyPage() {
 
   // ✅ SSE 연결
   useEffect(() => {
-  if (!vid) {
-    safeSetStatus("error");
-    toast.error("잘못된 인증 링크입니다.");
-    return;
-  }
-
-  const es = new EventSource(`/api/auth/verification-stream?vid=${vid}`);
-  safeSetStatus("connected");
-
-  es.addEventListener("connected", () => {
-    safeSetStatus("waiting");
-  });
-
-  es.addEventListener("verified", async () => {
-    if (statusRef.current !== "verified") {
-      safeSetStatus("verified");
-      toast.success("이메일 인증이 완료되었습니다!");
-      try {
-        await update();
-      } catch (err) {
-        console.error("세션 갱신 실패", err);
-      }
-      setTimeout(() => router.replace("/"), 1000);
-    }
-  });
-
-  es.addEventListener("error", () => {
-    if (statusRef.current !== "verified") {
+    if (!vid) {
       safeSetStatus("error");
-      toast.error("인증 처리 중 오류가 발생했습니다.");
+      toast.error("잘못된 인증 링크입니다.");
+      return;
     }
-    es.close();
-  });
 
-  return () => {
-    es.close();
-  };
-}, [vid, update, router]);
+    const es = new EventSource(`/api/auth/verification-stream?vid=${vid}`);
+    safeSetStatus("connected");
+
+    es.addEventListener("connected", () => {
+      safeSetStatus("waiting");
+    });
+
+    es.addEventListener("verified", async () => {
+      if (statusRef.current !== "verified") {
+        safeSetStatus("verified");
+        toast.success("이메일 인증이 완료되었습니다!");
+        try {
+          await update();
+        } catch (err) {
+          console.error("세션 갱신 실패", err);
+        }
+        setTimeout(() => router.replace("/"), 1000);
+      }
+    });
+
+    es.addEventListener("error", () => {
+      if (statusRef.current !== "verified") {
+        safeSetStatus("error");
+        toast.error("인증 처리 중 오류가 발생했습니다.");
+      }
+      es.close();
+    });
+
+    // ✅ 타임아웃 처리 (예: 10분)
+    const timeout = setTimeout(() => {
+      if (statusRef.current !== "verified") {
+        safeSetStatus("timeout");
+        toast.error("인증 시간이 만료되었습니다. 새 인증 메일을 요청해주세요.");
+        es.close();
+      }
+    }, 10 * 60 * 1000);
+
+    return () => {
+      es.close();
+      clearTimeout(timeout);
+    };
+  }, [vid, update, router]);
 
   // ✅ 세션 폴링 (백업)
   useEffect(() => {
@@ -139,7 +150,12 @@ export default function VerifyPage() {
       if (data?.code === "RATE_LIMITED") {
         setRateLimited(true);
         setRetryAfter(data?.retryAfter || 60);
-        toast.error("요청이 너무 많습니다. 잠시 후 다시 시도해주세요.");
+        toast.error(`요청이 너무 많습니다. ${retryAfter}초 후 다시 시도해주세요.`);
+        // 자동으로 버튼 활성화
+        setTimeout(() => {
+          setRateLimited(false);
+          setRetryAfter(0);
+        }, (data?.retryAfter || 60) * 1000);
         return;
       }
 

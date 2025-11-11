@@ -1,12 +1,11 @@
-// src/auth.ts
 import NextAuth from "next-auth";
-import { PrismaAdapter } from "@auth/prisma-adapter";
+import { CustomAdapter } from "@/lib/custom-adapter";
 import { prisma } from "@/lib/prisma";
 import Google from "next-auth/providers/google";
 import Kakao from "next-auth/providers/kakao";
 import Naver from "next-auth/providers/naver";
 import Credentials from "next-auth/providers/credentials";
-import { UserStatus, User as PrismaUser, Role } from "@prisma/client";
+import { UserStatus, Role } from "@prisma/client";
 import { sessionCache } from "@/lib/session-cache";
 import { logger } from "@/lib/logger";
 import { createAndEmailVerificationToken } from "@/lib/verification";
@@ -32,12 +31,12 @@ const CredentialsSchema = z.object({
 });
 
 export const { auth, handlers, signIn, signOut } = NextAuth({
-  adapter: PrismaAdapter(prisma),
+  adapter: CustomAdapter(),
   session: { strategy: "jwt", maxAge: 60 * 60 * 2 },
   trustHost: true,
   secret: AUTH_SECRET,
 
-  // ✅ v5: encode/decode 오버라이드 (JWS 기반)
+  // ✅ JWT encode/decode 오버라이드
   jwt: {
     async encode({ token, secret }) {
       if (!token) return "";
@@ -107,8 +106,8 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
 
         if (user.status !== UserStatus.ACTIVE)
           throw new Error("ACCOUNT_SUSPENDED");
-        if (!user.emailVerified) throw new Error("EMAIL_NOT_VERIFIED");
 
+        // 이메일 미인증 계정도 로그인은 허용 → 홈에서 배너로 안내
         return {
           id: user.id,
           email: user.email ?? "",
@@ -125,89 +124,26 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
   ],
 
   callbacks: {
-    async signIn({ user, account }) {
-      try {
-        if (!user.email) {
-          user.email = `${account?.provider}-${account?.providerAccountId}@placeholder.local`;
-          (user as any).unverified = true;
-        }
-        if (account?.provider) (user as any).lastProvider = account.provider;
-
-        if (account?.provider && user.email) {
-          const existingUser = await prisma.user.findUnique({
-            where: { email: user.email },
-          });
-          if (existingUser) {
-            await prisma.account.upsert({
-              where: {
-                provider_providerAccountId: {
-                  provider: account.provider,
-                  providerAccountId: account.providerAccountId,
-                },
-              },
-              update: { userId: existingUser.id },
-              create: {
-                userId: existingUser.id,
-                provider: account.provider,
-                providerAccountId: account.providerAccountId,
-                type: account.type,
-                access_token: (account as any).access_token,
-                refresh_token: (account as any).refresh_token,
-                expires_at: (account as any).expires_at,
-              },
-            });
-            return true;
-          }
-        }
-
-        if ((user as any).status && (user as any).status !== UserStatus.ACTIVE)
-          return false;
-
-        const emailIsPlaceholder = user.email?.endsWith("@placeholder.local");
-        if (!user.emailVerified && user.email && !emailIsPlaceholder) {
-          try {
-            const existing = await prisma.user.findUnique({
-              where: { email: user.email },
-            });
-            if (existing) {
-              await createAndEmailVerificationToken(existing, user.email);
-              logger.info("signIn: 인증 메일 발송", { email: user.email });
-            }
-          } catch (e: any) {
-            logger.warn("signIn: 인증 메일 발송 실패", { error: e?.message });
-          }
-        }
-        return true;
-      } catch (err: any) {
-        logger.error("signIn callback error", { error: err?.message });
-        return false;
-      }
-    },
-
     async jwt({ token, user }) {
-      // 로그인 직후: user 객체가 있을 때
       if (user) {
-        const u = user as PrismaUser & {
-          unverified?: boolean;
-          lastProvider?: string | null;
-        };
-        token.sub = u.id;
-        token.role = u.role ?? null;
-        token.status = u.status ?? null;
-        token.name = u.name ?? null;
-        token.email = u.email ?? "";
-        token.lastProvider = u.lastProvider ?? null;
+        token.sub = user.id;
+        token.role = user.role ?? null;
+        token.status = user.status ?? null;
+        token.name = user.name ?? null;
+        token.email = user.email ?? "";
+        token.lastProvider = user.lastProvider ?? null;
+        token.trustedEmail = user.trustedEmail ?? null;
+        token.subscriptionExpiresAt = user.subscriptionExpiresAt
+          ? new Date(user.subscriptionExpiresAt).toISOString()
+          : null;
+        token.emailVerified = user.emailVerified
+          ? new Date(user.emailVerified).toISOString()
+          : null;
+
+        // ✅ 이메일 미인증 플래그 세팅
         const emailIsPlaceholder =
-          u.email?.endsWith("@placeholder.local") ?? false;
-        token.unverified =
-          !u.emailVerified || emailIsPlaceholder || u.unverified === true;
-        token.trustedEmail = u.trustedEmail ?? null;
-        token.subscriptionExpiresAt = u.subscriptionExpiresAt
-          ? new Date(u.subscriptionExpiresAt).toISOString()
-          : null;
-        token.emailVerified = u.emailVerified
-          ? new Date(u.emailVerified).toISOString()
-          : null;
+          user.email?.endsWith("@placeholder.local") ?? false;
+        token.unverified = !user.emailVerified || emailIsPlaceholder;
 
         if (token.sub) {
           await sessionCache.set(`session:user:${token.sub}`, {
@@ -223,7 +159,7 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
           });
         }
       } else if (token.sub) {
-        // ✅ 로그인 이후 세션 갱신 시점: DB에서 최신값 반영
+        // 세션 갱신 시 DB에서 최신값 반영
         const freshUser = await prisma.user.findUnique({
           where: { id: token.sub },
           select: { emailVerified: true, trustedEmail: true },
@@ -236,7 +172,6 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
           token.unverified = !freshUser.emailVerified;
         }
       }
-
       return token;
     },
 
@@ -246,7 +181,7 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
         id: token.sub,
         role: token.role as Role,
         status: token.status as UserStatus,
-        unverified: token.unverified as boolean,
+        unverified: token.unverified as boolean, // 홈 배너에서 사용
         trustedEmail: token.trustedEmail as string | null,
         subscriptionExpiresAt: token.subscriptionExpiresAt
           ? new Date(token.subscriptionExpiresAt)

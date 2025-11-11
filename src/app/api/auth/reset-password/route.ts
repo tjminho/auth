@@ -1,90 +1,89 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
-import { z } from "zod";
+import { verifyPasswordResetToken } from "@/lib/verification";
 import { logger } from "@/lib/logger";
-import { hash } from "bcryptjs";
 
-const ResetPasswordSchema = z
-  .object({
-    token: z.string().min(10),
-    password: z.string().min(8).max(128),
-    confirmPassword: z.string().min(8).max(128),
-  })
-  .refine((data) => data.password === data.confirmPassword, {
-    message: "비밀번호가 일치하지 않습니다.",
-    path: ["confirmPassword"],
-  });
-
+/**
+ * ✅ 비밀번호 초기화 토큰 검증 API
+ * - 사용자가 이메일로 받은 reset 링크 클릭 시 호출
+ * - 토큰 유효성 검증 후 결과 반환
+ */
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
-    const parsed = ResetPasswordSchema.safeParse(body);
-    if (!parsed.success) {
-      return NextResponse.json({ error: "INVALID_INPUT" }, { status: 400 });
-    }
+    const token = body?.token;
 
-    const { token, password } = parsed.data;
-
-    // ✅ 토큰 조회 및 검증
-    const resetToken = await prisma.passwordResetToken.findUnique({
-      where: { token },
-    });
-
-    if (!resetToken || resetToken.used || resetToken.expiresAt < new Date()) {
-      logger.warn("비밀번호 재설정 토큰 오류", { token });
+    if (!token || typeof token !== "string") {
       return NextResponse.json(
-        {
-          error: "INVALID_OR_EXPIRED_TOKEN",
-          message: "토큰이 유효하지 않거나 만료되었습니다.",
-        },
+        { code: "TOKEN_REQUIRED", message: "토큰이 필요합니다." },
         { status: 400 }
       );
     }
 
-    // ✅ 유저 조회
-    const user = await prisma.user.findUnique({
-      where: { email: resetToken.email },
-    });
+    const result = await verifyPasswordResetToken(token);
 
-    if (!user) {
-      logger.error("비밀번호 재설정 실패: 유저 없음", {
-        email: resetToken.email,
-      });
-      return NextResponse.json(
-        {
-          error: "USER_NOT_FOUND",
-          message: "해당 이메일의 유저를 찾을 수 없습니다.",
-        },
-        { status: 404 }
-      );
+    switch (result.code) {
+      case "VERIFIED":
+        logger.info("비밀번호 초기화 토큰 검증 성공", {
+          userId: result.userId,
+          email: result.email,
+          vid: result.vid,
+        });
+        return NextResponse.json(
+          {
+            code: "VERIFIED",
+            email: result.email,
+            userId: result.userId,
+            vid: result.vid,
+          },
+          { status: 200 }
+        );
+
+      case "RESET_TOKEN_EXPIRED":
+        return NextResponse.json(
+          { code: "RESET_TOKEN_EXPIRED", message: "토큰이 만료되었습니다." },
+          { status: 400 }
+        );
+
+      case "RESET_TOKEN_NOT_FOUND":
+        return NextResponse.json(
+          {
+            code: "RESET_TOKEN_NOT_FOUND",
+            message: "토큰을 찾을 수 없습니다.",
+          },
+          { status: 404 }
+        );
+
+      case "USER_NOT_FOUND":
+        return NextResponse.json(
+          { code: "USER_NOT_FOUND", message: "사용자를 찾을 수 없습니다." },
+          { status: 404 }
+        );
+
+      case "INVALID_SIGNATURE":
+        return NextResponse.json(
+          { code: "INVALID_SIGNATURE", message: "잘못된 토큰입니다." },
+          { status: 400 }
+        );
+
+      case "EXPIRED":
+        return NextResponse.json(
+          { code: "RESET_TOKEN_EXPIRED", message: "토큰이 만료되었습니다." },
+          { status: 400 }
+        );
+
+      default:
+        return NextResponse.json(
+          { code: result.code ?? "SERVER_ERROR", message: "검증 실패" },
+          { status: 500 }
+        );
     }
-
-    // ✅ 비밀번호 해시 후 저장
-    const hashed = await hash(password, 10); // saltRounds = 10
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { password: hashed },
-    });
-
-    // ✅ 토큰 사용 처리
-    await prisma.passwordResetToken.update({
-      where: { token },
-      data: { used: true },
-    });
-
-    logger.info("비밀번호 재설정 성공", { email: user.email });
-
-    return NextResponse.json({ success: true });
   } catch (err: any) {
-    logger.error("reset-password route error", {
+    logger.error("비밀번호 초기화 토큰 검증 중 서버 오류", {
       message: err?.message,
       stack: err?.stack,
     });
     return NextResponse.json(
-      {
-        error: "SERVER_ERROR",
-        message: "서버 오류가 발생했습니다.",
-      },
+      { code: "SERVER_ERROR", message: err?.message || "서버 오류" },
       { status: 500 }
     );
   }

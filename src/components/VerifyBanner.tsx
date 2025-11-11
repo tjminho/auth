@@ -54,20 +54,19 @@ export default function VerifyBanner() {
       }
 
       // ✅ 성공 흐름
-      if (res.ok && data?.sent) {
-        toast.success("인증 메일을 발송했습니다.");
-        await update();
+if (res.ok && data?.code === "MAIL_SENT") {
+  toast.success("인증 메일을 발송했습니다.");
+  await update();
 
-        setTimeout(() => {
-          const target = new URL("/auth/verify", window.location.origin);
-          target.searchParams.set("email", email);
-          if (data?.vid) target.searchParams.set("vid", data.vid);
-              // ✅ 타입 에러 없이 안전
-              router.push(`${target.pathname}${target.search}` as Route);
-        }, 1500);
+  setTimeout(() => {
+    const target = new URL("/auth/verify", window.location.origin);
+    target.searchParams.set("email", email);
+    if (data?.vid) target.searchParams.set("vid", data.vid);
+    router.push(`${target.pathname}${target.search}` as Route);
+  }, 1500);
 
-        return;
-      }
+  return;
+}
 
       // ✅ 실패 코드별 처리
       switch (data?.code) {

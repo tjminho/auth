@@ -2,13 +2,13 @@
   "name": "mzmon",
   "version": "0.1.0",
   "private": true,
-"scripts": {
-  "lint": "next lint",
-  "dev": "next dev --turbopack",
-  "build": "next build",
-  "start": "next start",
-  "clean": "rimraf .next dist"
-},
+  "scripts": {
+    "lint": "next lint",
+    "dev": "next dev --turbopack",
+    "build": "next build",
+    "start": "next start",
+    "clean": "rimraf .next dist"
+  },
   "dependencies": {
     "@auth/prisma-adapter": "^2.10.0",
     "@hookform/resolvers": "^5.2.2",
@@ -47,7 +47,6 @@
     "resend": "^6.1.2",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.3.1",
-    "ws": "^8.18.3",
     "zod": "^4.1.11"
   },
   "devDependencies": {

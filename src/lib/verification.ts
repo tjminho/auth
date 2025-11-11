@@ -3,206 +3,151 @@
 import { prisma } from "@/lib/prisma";
 import { resend } from "@/lib/resend";
 import { VerifyEmailTemplate } from "@/lib/email-template";
-import crypto from "crypto";
-import { addMinutes } from "date-fns";
 import { VerificationType, UserStatus, User } from "@prisma/client";
+import { recordAuditLog } from "@/lib/audit";
 import { logger } from "@/lib/logger";
-import { hit } from "@/lib/rate-limit";
+import { addMinutes } from "date-fns";
+import { SignJWT, jwtVerify } from "jose";
+import crypto from "crypto";
 
-// ===== 환경변수 =====
-const TTL_MIN = Number(process.env.EMAIL_TOKEN_TTL_MIN ?? 15);
-const RESEND_COOLDOWN_MS = 60_000;
-const DAILY_LIMIT = 10;
-const SECRET = process.env.EMAIL_TOKEN_SECRET!;
+/* ================================
+   환경변수/상수
+================================ */
+const EMAIL_TTL_MIN = Number(process.env.EMAIL_TOKEN_TTL_MIN ?? 15);
+const RESET_TTL_MIN = Number(process.env.PASSWORD_RESET_TTL_MIN ?? 30);
+const SECRET = new TextEncoder().encode(process.env.EMAIL_TOKEN_SECRET!);
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL!;
 const FROM_EMAIL = process.env.FROM_EMAIL!;
+const RESEND_COOLDOWN_MS = Number(
+  process.env.VERIFICATION_COOLDOWN_MS ?? 60_000
+);
+const DAILY_LIMIT = Number(process.env.VERIFICATION_DAILY_LIMIT ?? 10);
 
-// ===== 에러 코드 타입 =====
+/* ================================
+   타입/에러
+================================ */
 export type VerifyErrorCode =
   | "USER_ID_REQUIRED"
   | "INVALID_EMAIL"
-  | "DISPOSABLE_EMAIL_BLOCKED"
+  | "RESEND_FAILED"
+  | "INVALID_SIGNATURE"
+  | "EXPIRED"
+  | "NOT_FOUND"
+  | "USER_NOT_FOUND"
+  | "EMAIL_SENT"
+  | "RESET_TOKEN_NOT_FOUND"
+  | "RESET_TOKEN_EXPIRED"
   | "ALREADY_VERIFIED"
   | "RATE_LIMITED"
   | "DAILY_LIMIT_EXCEEDED"
-  | "RESEND_FAILED"
-  | "INVALID_SIGNATURE"
-  | "NOT_FOUND"
-  | "ALREADY_USED"
-  | "EXPIRED"
-  | "USER_NOT_FOUND"
-  | "EMAIL_MISMATCH"
-  | "IP_MISMATCH"
-  | "UA_MISMATCH"
-  | "SIGNUP_TOKEN_INVALID"
   | "VERIFIED";
 
-// ===== Custom Error =====
-class VerifyError extends Error {
-  code: VerifyErrorCode;
-  retryAfter?: number;
-  constructor(code: VerifyErrorCode, message?: string, retryAfter?: number) {
-    super(message || code);
-    this.code = code;
-    this.retryAfter = retryAfter;
-  }
-}
-
-// ===== 토큰 페이로드 =====
-type SignedPayload = {
-  vid: string; // VerificationSession.vid
-  uid: string;
-  exp: number;
-  ip?: string;
-  ua?: string;
-  st?: string;
-};
-
-// ===== 검증 결과 타입 =====
 export type VerifyResult = {
-  email: string;
   code: VerifyErrorCode;
+  email?: string;
   userId?: string;
   vid?: string;
+  token?: string;
+  resetUrl?: string;
+  retryAfter?: number;
 };
 
-// ===== 유틸 =====
-function b64url(input: Buffer | string): string {
-  return Buffer.from(input)
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
-function fromB64url(input: string): string {
-  input = input.replace(/-/g, "+").replace(/_/g, "/");
-  while (input.length % 4) input += "=";
-  return Buffer.from(input, "base64").toString();
-}
-function sign(payload: any): string {
-  const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const body = b64url(JSON.stringify(payload));
-  const data = `${header}.${body}`;
-  const sig = crypto
-    .createHmac("sha256", SECRET)
-    .update(data)
-    .digest("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-  return `${data}.${sig}`;
-}
-function verify(token: string): any | null {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [header, body, sig] = parts;
-  const data = `${header}.${body}`;
-  const expected = crypto
-    .createHmac("sha256", SECRET)
-    .update(data)
-    .digest("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-  if (sig !== expected) return null;
-  try {
-    return JSON.parse(fromB64url(body));
-  } catch {
-    return null;
-  }
-}
-function hash(input: string) {
-  return crypto.createHash("sha256").update(input).digest("hex");
-}
+type TokenPayload = {
+  vid: string;
+  uid: string;
+  type: VerificationType;
+  val: string;
+};
+
+/* ================================
+   유틸
+================================ */
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
-function isFormatValidEmail(email: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-const DISPOSABLE_DOMAINS = new Set([
-  "mailinator.com",
-  "10minutemail.com",
-  "guerrillamail.com",
-  "yopmail.com",
-]);
-function isDisposable(email: string): boolean {
-  const domain = email.split("@")[1];
-  return !!domain && DISPOSABLE_DOMAINS.has(domain);
+function maskEmail(email?: string): string | undefined {
+  if (!email) return undefined;
+  const [name, domain] = email.split("@");
+  if (!domain) return email;
+  const maskedName =
+    name.length <= 2 ? name[0] + "*" : name.slice(0, 2) + "***";
+  return `${maskedName}@${domain}`;
 }
 
-// ===== 내부 헬퍼: 발송 제한 체크 =====
-async function assertResendAllowed(
-  user: Pick<
-    User,
-    "id" | "lastVerificationSentAt" | "emailVerified" | "trustedEmail"
-  >,
-  email: string,
-  ip?: string
-) {
-  if (user.emailVerified !== null && user.trustedEmail === email) {
-    throw new VerifyError("ALREADY_VERIFIED");
+async function signToken(
+  payload: TokenPayload,
+  ttlMin: number
+): Promise<string> {
+  return await new SignJWT(payload as any)
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(`${ttlMin}m`)
+    .sign(SECRET);
+}
+
+async function verifyToken(
+  token: string
+): Promise<{ payload?: TokenPayload; code?: VerifyErrorCode }> {
+  try {
+    const { payload } = await jwtVerify(token, SECRET);
+    return { payload: payload as TokenPayload };
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg.includes("exp") || msg.includes("expired"))
+      return { code: "EXPIRED" };
+    return { code: "INVALID_SIGNATURE" };
+  }
+}
+
+/* ================================
+   이메일 인증 발급
+================================ */
+export async function createAndEmailVerificationToken(
+  user: User,
+  targetEmailRaw: string
+): Promise<VerifyResult> {
+  if (!user?.id) return { code: "USER_ID_REQUIRED" };
+
+  const targetEmail = normalizeEmail(targetEmailRaw);
+  const expiresAt = addMinutes(new Date(), EMAIL_TTL_MIN);
+
+  // 이미 인증된 계정
+  if (
+    user.emailVerified != null &&
+    normalizeEmail(user.trustedEmail ?? "") === targetEmail
+  ) {
+    return { code: "ALREADY_VERIFIED", email: targetEmail, userId: user.id };
   }
 
-  const r = await hit(ip || "unknown", `email:${email}`);
-  if (r.limited) {
-    throw new VerifyError(
-      "RATE_LIMITED",
-      "Too many requests",
-      r.retryAfter || r.reset || 60
+  // Rate-limit / Daily-limit 체크
+  const now = new Date();
+  if (
+    user.lastVerificationSentAt &&
+    now.getTime() - user.lastVerificationSentAt.getTime() < RESEND_COOLDOWN_MS
+  ) {
+    const retryAfter = Math.ceil(
+      (RESEND_COOLDOWN_MS -
+        (now.getTime() - user.lastVerificationSentAt.getTime())) /
+        1000
     );
+    return { code: "RATE_LIMITED", retryAfter };
   }
 
-  if (user.lastVerificationSentAt) {
-    const elapsed = Date.now() - user.lastVerificationSentAt.getTime();
-    if (elapsed < RESEND_COOLDOWN_MS) {
-      const retryAfter = Math.ceil((RESEND_COOLDOWN_MS - elapsed) / 1000);
-      throw new VerifyError("RATE_LIMITED", "Cooldown active", retryAfter);
-    }
-  }
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
 
   const todayCount = await prisma.verification.count({
     where: {
-      identifier: email,
+      userId: user.id,
       type: VerificationType.EMAIL,
-      createdAt: { gte: new Date(new Date().setHours(0, 0, 0, 0)) },
+      createdAt: { gte: todayStart },
     },
   });
   if (todayCount >= DAILY_LIMIT) {
-    throw new VerifyError("DAILY_LIMIT_EXCEEDED");
-  }
-}
-
-// ===== 공개 API: 인증 토큰 생성 및 발송 =====
-export async function createAndEmailVerificationToken(
-  user: User,
-  targetEmailRaw: string,
-  meta?: { ip?: string; ua?: string; signupToken?: string }
-): Promise<{ token: string; vid: string }> {
-  if (!user?.id) throw new VerifyError("USER_ID_REQUIRED");
-
-  const targetEmail = normalizeEmail(targetEmailRaw);
-  if (!isFormatValidEmail(targetEmail)) throw new VerifyError("INVALID_EMAIL");
-  if (targetEmail.endsWith("@placeholder.local") || isDisposable(targetEmail)) {
-    throw new VerifyError("DISPOSABLE_EMAIL_BLOCKED");
+    return { code: "DAILY_LIMIT_EXCEEDED" };
   }
 
-  await assertResendAllowed(
-    {
-      id: user.id,
-      lastVerificationSentAt: user.lastVerificationSentAt,
-      emailVerified: user.emailVerified,
-      trustedEmail: user.trustedEmail,
-    },
-    targetEmail,
-    meta?.ip
-  );
-
-  const expiresAt = addMinutes(new Date(), TTL_MIN);
-
-  // ✅ Verification + VerificationSession 함께 생성
   const { verification, session } = await prisma.$transaction(async (tx) => {
-    // 1. 기존 Verification 무효화
     await tx.verification.updateMany({
       where: {
         userId: user.id,
@@ -211,16 +156,10 @@ export async function createAndEmailVerificationToken(
       },
       data: { consumedAt: new Date() },
     });
-
-    // 2. 기존 VerificationSession 정리 (아직 인증 안 된 세션 제거)
     await tx.verificationSession.deleteMany({
-      where: {
-        userId: user.id,
-        verifiedAt: null,
-      },
+      where: { userId: user.id, verifiedAt: null },
     });
 
-    // 3. 새 Verification 생성
     const verification = await tx.verification.create({
       data: {
         identifier: targetEmail,
@@ -230,34 +169,28 @@ export async function createAndEmailVerificationToken(
         expiresAt,
       },
     });
-
-    // 4. 새 VerificationSession 생성
     const session = await tx.verificationSession.create({
       data: {
         userId: user.id,
+        email: targetEmail,
+        type: VerificationType.EMAIL,
         expiresAt,
       },
     });
-
     return { verification, session };
   });
 
-  const payload = {
-    vid: session.vid, // ✅ VerificationSession.vid 사용
+  const payload: TokenPayload = {
+    vid: session.vid,
     uid: user.id,
-    exp: Math.floor(expiresAt.getTime() / 1000),
-    ip: meta?.ip ? hash(meta.ip) : undefined,
-    ua: meta?.ua ? hash(meta.ua) : undefined,
-    st: meta?.signupToken ? hash(meta.signupToken) : undefined,
+    type: VerificationType.EMAIL,
+    val: verification.value,
   };
-  const signed = sign(payload);
+  const token = await signToken(payload, EMAIL_TTL_MIN);
 
-  const query = new URLSearchParams({
-    email: targetEmail,
-    token: signed,
-    vid: session.vid, // ✅ 메일 링크에도 session.vid
-  });
-  const verifyUrl = `${APP_URL}/auth/token-bridge?${query.toString()}`;
+  const verifyUrl = `${APP_URL}/auth/token-bridge?token=${encodeURIComponent(
+    token
+  )}&vid=${encodeURIComponent(session.vid)}`;
 
   try {
     await resend.emails.send({
@@ -271,13 +204,7 @@ export async function createAndEmailVerificationToken(
       where: { id: verification.id },
       data: { consumedAt: new Date() },
     });
-    logger.error("메일 발송 실패", {
-      email: targetEmail,
-      userId: user.id,
-      message: err?.message,
-      stack: err?.stack,
-    });
-    throw new VerifyError("RESEND_FAILED");
+    return { code: "RESEND_FAILED" };
   }
 
   await prisma.user.update({
@@ -285,98 +212,182 @@ export async function createAndEmailVerificationToken(
     data: { lastVerificationSentAt: new Date() },
   });
 
-  logger.info("인증 메일 발송 완료", {
+  return {
+    code: "EMAIL_SENT", // 기존 "VERIFIED" → "EMAIL_SENT"
+    token,
+    vid: session.vid,
     email: targetEmail,
     userId: user.id,
-    ip: meta?.ip,
-    ua: meta?.ua,
-    signupToken: meta?.signupToken ? "***" : undefined,
-  });
-
-  return { token: signed, vid: session.vid }; // ✅ session.vid도 함께 반환
+  };
 }
-export async function verifyEmailByValueToken(
+
+/* ================================
+   이메일 인증 검증
+================================ */
+export async function verifyEmailToken(
   token: string,
-  opts?: { ip?: string; ua?: string; signupToken?: string }
-): Promise<VerifyResult | null> {
-  try {
-    const payload = verify(token);
-    if (!payload) return { email: "", code: "INVALID_SIGNATURE" };
-    if (payload.exp * 1000 < Date.now()) return { email: "", code: "EXPIRED" };
+  queryVid?: string,
+  req?: Request // ✅ 요청 객체 받아서 IP/UA 기록
+): Promise<VerifyResult> {
+  const { payload, code } = await verifyToken(token);
+  if (code) return { code };
+  if (!payload) return { code: "INVALID_SIGNATURE" };
 
-    const verification = await prisma.verification.findFirst({
-      where: { userId: payload.uid, type: VerificationType.EMAIL },
-      orderBy: { createdAt: "desc" },
-    });
-    if (!verification) return { email: "", code: "NOT_FOUND" };
-    if (verification.consumedAt)
-      return { email: verification.identifier, code: "ALREADY_USED" };
-    if (verification.expiresAt < new Date())
-      return { email: verification.identifier, code: "EXPIRED" };
+  // vid 교차 검증
+  if (queryVid && queryVid !== payload.vid) {
+    logger.warn("vid mismatch", { queryVid, payloadVid: payload.vid });
+    return { code: "INVALID_SIGNATURE" };
+  }
 
-    // IP/UA 바인딩 검증
-    if (payload.ip && payload.ip !== hash(opts?.ip || "")) {
-      return { email: verification.identifier, code: "IP_MISMATCH" };
-    }
-    if (payload.ua && payload.ua !== hash(opts?.ua || "")) {
-      return { email: verification.identifier, code: "UA_MISMATCH" };
-    }
-    if (payload.st && payload.st !== hash(opts?.signupToken || "")) {
-      return { email: verification.identifier, code: "SIGNUP_TOKEN_INVALID" };
-    }
+  const [session, verification, user] = await Promise.all([
+    prisma.verificationSession.findUnique({ where: { vid: payload.vid } }),
+    prisma.verification.findFirst({
+      where: {
+        userId: payload.uid,
+        type: VerificationType.EMAIL,
+        value: payload.val,
+        consumedAt: null,
+      },
+    }),
+    prisma.user.findUnique({ where: { id: payload.uid } }),
+  ]);
 
-    const user = await prisma.user.findUnique({ where: { id: payload.uid } });
-    if (!user)
-      return { email: verification.identifier, code: "USER_NOT_FOUND" };
-
-    const normalizedIdentifier = normalizeEmail(verification.identifier);
-    const matches =
-      normalizeEmail(user.email || "") === normalizedIdentifier ||
-      normalizeEmail(user.trustedEmail || "") === normalizedIdentifier;
-    if (!matches) {
-      return { email: verification.identifier, code: "EMAIL_MISMATCH" };
-    }
-
-    // ✅ DB 업데이트
-    await prisma.$transaction(async (tx) => {
-      await tx.user.update({
-        where: { id: user.id },
-        data: {
-          trustedEmail: normalizedIdentifier,
-          emailVerified: new Date(),
-          ...(user.status !== UserStatus.SUSPENDED
-            ? { status: UserStatus.ACTIVE }
-            : {}),
-        },
-      });
-      await tx.verification.update({
-        where: { id: verification.id },
-        data: { consumedAt: new Date() },
-      });
-      await tx.verificationSession.updateMany({
-        where: { vid: payload.vid },
-        data: { verifiedAt: new Date() },
-      });
-    });
-
-    logger.info("이메일 인증 성공", {
-      email: normalizedIdentifier,
-      userId: user.id,
-      ip: opts?.ip,
-      ua: opts?.ua,
-    });
-
+  if (!session || !verification) return { code: "NOT_FOUND" };
+  if (!user) return { code: "USER_NOT_FOUND" };
+  if (verification.expiresAt < new Date()) return { code: "EXPIRED" };
+  if (session.verifiedAt) {
     return {
-      email: normalizedIdentifier,
-      code: "VERIFIED",
+      code: "ALREADY_VERIFIED",
+      email: session.email ?? user.trustedEmail ?? user.email ?? "",
       userId: user.id,
       vid: payload.vid,
     };
-  } catch (err: any) {
-    logger.error("이메일 인증 처리 중 오류", {
-      message: err?.message,
-      stack: err?.stack,
-    });
-    return null;
   }
+
+  const identifier = normalizeEmail(verification.identifier);
+
+  // ✅ 환경 정보 추출
+  const ipHeader = req?.headers.get("x-forwarded-for") ?? "";
+  const ip = ipHeader.split(",")[0].trim() || undefined;
+  const ua = req?.headers.get("user-agent") ?? undefined;
+
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({
+      where: { id: user.id },
+      data: {
+        trustedEmail: identifier,
+        emailVerified: new Date(),
+        ...(user.status !== UserStatus.SUSPENDED
+          ? { status: UserStatus.ACTIVE }
+          : {}),
+      },
+    });
+
+    await tx.verification.update({
+      where: { id: verification.id },
+      data: { consumedAt: new Date() },
+    });
+
+    await tx.verificationSession.update({
+      where: { vid: session.vid },
+      data: { verifiedAt: new Date() },
+    });
+
+    // ✅ VerifiedEmail 기록 (IP/UA 포함)
+    await tx.verifiedEmail.upsert({
+      where: { userId_email: { userId: user.id, email: identifier } },
+      update: {
+        verifiedAt: new Date(),
+        ipAddress: ip,
+        userAgent: ua,
+      },
+      create: {
+        userId: user.id,
+        email: identifier,
+        verifiedAt: new Date(),
+        ipAddress: ip,
+        userAgent: ua,
+      },
+    });
+  });
+
+  // ✅ 감사 로그 기록
+  await recordAuditLog(user.id, "EMAIL_VERIFIED", ip, ua);
+
+  logger.info("이메일 인증 성공", {
+    email: maskEmail(identifier),
+    userId: user.id,
+    vid: payload.vid,
+    ip,
+    ua,
+  });
+
+  return {
+    code: "VERIFIED",
+    email: identifier,
+    userId: user.id,
+    vid: payload.vid,
+  };
+}
+
+/* ================================
+   비밀번호 초기화 토큰 검증
+================================ */
+export async function verifyPasswordResetToken(
+  token: string
+): Promise<VerifyResult> {
+  const { payload, code } = await verifyToken(token);
+  if (code) return { code };
+  if (!payload) return { code: "INVALID_SIGNATURE" };
+
+  // ✅ 세션/토큰/사용자 조회
+  const [session, verification, user] = await Promise.all([
+    prisma.verificationSession.findUnique({
+      where: { vid: payload.vid },
+    }),
+    prisma.verification.findFirst({
+      where: {
+        userId: payload.uid,
+        type: VerificationType.PASSWORD_RESET,
+        value: payload.val,
+        consumedAt: null,
+      },
+    }),
+    prisma.user.findUnique({ where: { id: payload.uid } }),
+  ]);
+
+  if (!session || !verification) {
+    logger.warn("비밀번호 초기화 실패: 세션/토큰 불일치", {
+      vid: payload.vid,
+      uid: payload.uid,
+    });
+    return { code: "RESET_TOKEN_NOT_FOUND" };
+  }
+  if (!user) return { code: "USER_NOT_FOUND" };
+  if (verification.expiresAt < new Date())
+    return { code: "RESET_TOKEN_EXPIRED" };
+
+  // ✅ 토큰 소비 처리
+  await prisma.$transaction(async (tx) => {
+    await tx.verification.update({
+      where: { id: verification.id },
+      data: { consumedAt: new Date() },
+    });
+    await tx.verificationSession.update({
+      where: { vid: session.vid },
+      data: { verifiedAt: new Date() },
+    });
+  });
+
+  logger.info("비밀번호 초기화 토큰 검증 성공", {
+    email: maskEmail(user.email ?? user.trustedEmail ?? ""),
+    userId: user.id,
+  });
+
+  return {
+    code: "VERIFIED",
+    email: user.email ?? user.trustedEmail ?? "",
+    userId: user.id,
+    vid: payload.vid,
+  };
 }

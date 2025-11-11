@@ -31,19 +31,25 @@ export async function POST(req: Request) {
     if (!email || typeof email !== "string") {
       logger.warn("재발송 요청 실패: 이메일 누락", { ip, ua });
       return NextResponse.json(
-        {
-          success: false,
-          sent: false,
-          code: "EMAIL_REQUIRED",
-          message: "이메일이 필요합니다.",
-        },
+        { code: "EMAIL_REQUIRED", message: "이메일이 필요합니다." },
         { status: 400 }
       );
     }
     const normalizedEmail = email.trim().toLowerCase();
 
     // ✅ Rate Limit 체크
-    const limit = await hitEmail(ip, normalizedEmail);
+    const limit = await hitEmail(ip, normalizedEmail).catch((err) => {
+      logger.error("Rate-limit 체크 실패", { error: err?.message, ip, email });
+      return {
+        limited: false,
+        remaining: 1,
+        reset: 60,
+        count: 0,
+        limit: 1,
+        retryAfter: 0,
+      }; // ✅ 항상 동일한 구조 반환
+    });
+
     if (limit.limited) {
       logger.warn("재발송 요청 Rate Limit 초과", {
         email: maskEmail(normalizedEmail),
@@ -53,8 +59,6 @@ export async function POST(req: Request) {
       });
       return NextResponse.json(
         {
-          success: false,
-          sent: false,
           code: "RATE_LIMITED",
           message: "요청이 너무 많습니다. 잠시 후 다시 시도하세요.",
           retryAfter: limit.retryAfter,
@@ -76,12 +80,7 @@ export async function POST(req: Request) {
         ip,
       });
       const response = NextResponse.json(
-        {
-          success: false,
-          sent: false,
-          code: "USER_NOT_FOUND",
-          message: "해당 유저를 찾을 수 없습니다.",
-        },
+        { code: "USER_NOT_FOUND", message: "해당 유저를 찾을 수 없습니다." },
         { status: 404 }
       );
       return clearAuthCookies(response);
@@ -94,11 +93,7 @@ export async function POST(req: Request) {
         ip,
       });
       return NextResponse.json(
-        {
-          success: true,
-          code: "ALREADY_VERIFIED",
-          message: "이미 인증된 계정입니다.",
-        },
+        { code: "ALREADY_VERIFIED", message: "이미 인증된 계정입니다." },
         { status: 200 }
       );
     }
@@ -108,8 +103,6 @@ export async function POST(req: Request) {
       logger.error("재발송 실패: 발송 대상 이메일 없음", { userId: user.id });
       return NextResponse.json(
         {
-          success: false,
-          sent: false,
           code: "NO_TARGET_EMAIL",
           message: "발송 대상 이메일을 찾을 수 없습니다.",
         },
@@ -117,11 +110,8 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ VerificationSession 생성 + 메일 발송 (내부에서 vid 반환)
-    const { vid } = await createAndEmailVerificationToken(user, targetEmail, {
-      ip,
-      ua,
-    });
+    // ✅ VerificationSession 생성 + 메일 발송
+    const { vid } = await createAndEmailVerificationToken(user, targetEmail);
 
     logger.info("재발송 성공", {
       userId: user.id,
@@ -132,7 +122,7 @@ export async function POST(req: Request) {
     });
 
     return NextResponse.json(
-      { success: true, sent: true, code: "MAIL_SENT", vid },
+      { code: "MAIL_SENT", vid, email: targetEmail, userId: user.id },
       { status: 200 }
     );
   } catch (err: any) {
@@ -141,12 +131,7 @@ export async function POST(req: Request) {
       stack: err?.stack,
     });
     return NextResponse.json(
-      {
-        success: false,
-        sent: false,
-        code: "SERVER_ERROR",
-        message: err?.message || "재발송 실패",
-      },
+      { code: "SERVER_ERROR", message: err?.message || "재발송 실패" },
       { status: 500 }
     );
   }

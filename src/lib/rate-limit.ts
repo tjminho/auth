@@ -1,5 +1,7 @@
 import { Redis } from "@upstash/redis";
 import crypto from "crypto";
+import { logger } from "@/lib/logger";
+import { EMAIL_RESEND_COOLDOWN_MS, EMAIL_DAILY_LIMIT } from "@/lib/constants";
 
 type WindowConfig = {
   windowSeconds: number; // 윈도우 길이
@@ -7,21 +9,31 @@ type WindowConfig = {
   prefix?: string; // 키 prefix
 };
 
+// ✅ Redis 클라이언트 싱글톤 관리
+let redisClient: Redis | null = null;
+function getRedis() {
+  if (!redisClient) {
+    if (
+      !process.env.UPSTASH_REDIS_REST_URL ||
+      !process.env.UPSTASH_REDIS_REST_TOKEN
+    ) {
+      logger.error("Upstash Redis 환경 변수가 설정되지 않았습니다.");
+      throw new Error("Upstash Redis 환경 변수가 설정되지 않았습니다.");
+    }
+    redisClient = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+  }
+  return redisClient;
+}
+
 export class RateLimiter {
   private redis: Redis;
   private cfg: WindowConfig;
 
   constructor(cfg: WindowConfig) {
-    if (
-      !process.env.UPSTASH_REDIS_REST_URL ||
-      !process.env.UPSTASH_REDIS_REST_TOKEN
-    ) {
-      throw new Error("Upstash Redis 환경 변수가 설정되지 않았습니다.");
-    }
-    this.redis = new Redis({
-      url: process.env.UPSTASH_REDIS_REST_URL,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    });
+    this.redis = getRedis();
     this.cfg = { prefix: "rl", ...cfg };
   }
 
@@ -45,7 +57,7 @@ export class RateLimiter {
       const count = (results?.[0]?.[1] as number) ?? 0;
       const allowed = count <= this.cfg.max;
       const remaining = Math.max(this.cfg.max - count, 0);
-      const reset = (bucket + 1) * this.cfg.windowSeconds - now; // 다음 윈도우까지 남은 초
+      const reset = (bucket + 1) * this.cfg.windowSeconds - now;
 
       return {
         allowed,
@@ -53,11 +65,13 @@ export class RateLimiter {
         reset,
         count,
         limit: this.cfg.max,
-        retryAfter: allowed ? 0 : reset, // 제한 걸렸을 때만 남은 시간
+        retryAfter: allowed ? 0 : reset,
       };
     } catch (err) {
-      console.error("RateLimiter check 실패:", err);
-      // Redis 장애 시 서비스는 계속 동작하도록 허용
+      logger.error("RateLimiter check 실패", {
+        error: (err as Error)?.message,
+      });
+      // Redis 장애 시 서비스는 계속 동작하도록 fallback 허용
       return {
         allowed: true,
         remaining: this.cfg.max,
@@ -72,62 +86,39 @@ export class RateLimiter {
 
 // ===== 공통 유틸: 안전한 키 생성 =====
 function safeKey(...parts: string[]) {
-  return crypto.createHash("sha256").update(parts.join(":")).digest("hex");
+  const salt = process.env.RATE_LIMIT_SALT || "";
+  return crypto
+    .createHash("sha256")
+    .update(parts.join(":") + salt)
+    .digest("hex");
 }
 
 // ===== 기본 API 제한 (IP + key 기준) =====
 const defaultLimiter = new RateLimiter({
-  windowSeconds: 60, // 1분
-  max: 5, // 5회 허용
+  windowSeconds: 60,
+  max: 5,
   prefix: "rl",
 });
-
 export async function hit(ip: string, key: string) {
-  const r = await defaultLimiter.check(safeKey(ip, key));
-  return {
-    limited: !r.allowed,
-    remaining: r.remaining,
-    reset: r.reset,
-    count: r.count,
-    limit: r.limit,
-    retryAfter: r.retryAfter,
-  };
+  return defaultLimiter.check(safeKey(ip, key));
 }
 
 // ===== 로그인 전용 제한 (IP + 이메일 기준) =====
 const loginLimiter = new RateLimiter({
-  windowSeconds: 600, // 10분
-  max: 10, // 10회 허용
+  windowSeconds: 600,
+  max: 10,
   prefix: "login",
 });
-
 export async function hitLogin(ip: string, email: string) {
-  const r = await loginLimiter.check(safeKey(ip, email.toLowerCase()));
-  return {
-    limited: !r.allowed,
-    remaining: r.remaining,
-    reset: r.reset,
-    count: r.count,
-    limit: r.limit,
-    retryAfter: r.retryAfter,
-  };
+  return loginLimiter.check(safeKey(ip, email.toLowerCase()));
 }
 
 // ===== 이메일 발송 전용 제한 (IP + 이메일 기준) =====
 const emailLimiter = new RateLimiter({
-  windowSeconds: 60, // 1분
-  max: 1, // 1분에 1회
+  windowSeconds: EMAIL_RESEND_COOLDOWN_MS / 1000, // constants.ts 연동
+  max: EMAIL_DAILY_LIMIT,
   prefix: "email",
 });
-
 export async function hitEmail(ip: string, email: string) {
-  const r = await emailLimiter.check(safeKey(ip, email.toLowerCase()));
-  return {
-    limited: !r.allowed,
-    remaining: r.remaining,
-    reset: r.reset,
-    count: r.count,
-    limit: r.limit,
-    retryAfter: r.retryAfter,
-  };
+  return emailLimiter.check(safeKey(ip, email.toLowerCase()));
 }

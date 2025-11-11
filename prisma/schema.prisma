@@ -8,7 +8,6 @@ datasource db {
 }
 
 // ===== Enums =====
-
 enum VerificationType {
   EMAIL
   PASSWORD_RESET
@@ -38,43 +37,44 @@ enum SubscriptionStatus {
 }
 
 // ===== Models =====
-
 model User {
   id                     String     @id @default(uuid())
   name                   String?
-  // 원본 이메일(소셜/프로바이더 제공). nullable. 단일 unique 없음.
-  email                  String?
-  // 검증 완료된 대표 이메일(VerifiedEmail 중 선택). 단일 unique.
-  trustedEmail           String?    @unique
+  email                  String?    @unique @db.VarChar(255) // 원본 이메일, nullable
+  trustedEmail           String?    @unique // 검증 완료된 대표 이메일
   emailVerified          DateTime?
   lastVerificationSentAt DateTime?
-  provider               String? // 최초 가입 시 사용한 provider 식별자
-  password               String?    @db.VarChar(255)
+  provider               String?
+  password               String?    @db.Text
   image                  String?
   unverified             Boolean    @default(false)
   role                   Role       @default(USER)
   status                 UserStatus @default(ACTIVE)
   mfaEnabled             Boolean    @default(false)
-  mfaSecret              String?    @db.VarChar(255) // 저장 시 암호화/해싱 권장
+  mfaSecret              String?    @db.Text
   mfaVerifiedAt          DateTime?
   deletedAt              DateTime?
+  lastProvider           String?
+  subscriptionExpiresAt  DateTime?
 
   // 관계
   accounts             Account[]
   sessions             Session[]
   verifiedEmails       VerifiedEmail[]
+  verificationSessions VerificationSession[]
+  passwordResets       PasswordResetToken[]
   createdCompanies     Company[]             @relation("CompanyCreator")
   adminCompanies       Company[]             @relation("CompanyAdmin")
   loginHistory         LoginHistory[]
-  verificationSessions VerificationSession[]
+  FcmToken             FcmToken[]
 
   createdAt DateTime   @default(now())
   updatedAt DateTime   @updatedAt
-  FcmToken  FcmToken[]
+  AuditLog  AuditLog[]
 
-  // 소셜/프로바이더 + 이메일 복합 고유 (중복 계정 방지)
-  @@unique([provider, email])
+  @@unique([provider, email]) // provider+email 조합 중복 방지
   @@index([status])
+  @@index([email])
 }
 
 model Account {
@@ -83,6 +83,7 @@ model Account {
   type              String
   provider          String
   providerAccountId String
+  email             String?
   access_token      String? @db.Text
   refresh_token     String? @db.Text
   expires_at        Int?
@@ -98,6 +99,7 @@ model Account {
 
   @@unique([provider, providerAccountId])
   @@index([userId])
+  @@index([email])
 }
 
 model Session {
@@ -116,7 +118,7 @@ model Session {
 
 model Verification {
   id         String           @id @default(uuid())
-  identifier String           @db.VarChar(255) // 이메일 또는 사용자 ID
+  identifier String           @db.VarChar(255)
   userId     String
   value      String
   type       VerificationType
@@ -124,10 +126,24 @@ model Verification {
   consumedAt DateTime?
   createdAt  DateTime         @default(now())
 
-  // consumedAt IS NULL 조건 유니크는 raw SQL partial index로 migration에서 추가하세요.
+  @@index([userId, type])
   @@index([identifier])
   @@index([value])
-  @@index([userId])
+}
+
+model VerificationSession {
+  vid        String           @id @default(uuid())
+  userId     String
+  email      String? // ✅ nullable 처리
+  type       VerificationType @default(EMAIL)
+  expiresAt  DateTime
+  createdAt  DateTime         @default(now())
+  verifiedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, email, type])
+  @@index([expiresAt])
 }
 
 model VerifiedEmail {
@@ -152,22 +168,18 @@ model Company {
   phoneNumber String?
   address     String?
 
-  // 생성자/관리자 관계 (사용자 삭제 시 회사 보존을 위해 SetNull)
   createdBy String?
   creator   User?   @relation("CompanyCreator", fields: [createdBy], references: [id], onDelete: SetNull)
   adminId   String?
   admin     User?   @relation("CompanyAdmin", fields: [adminId], references: [id], onDelete: SetNull)
 
-  // 구독 상태 (.net과 일관된 enum)
   subscriptionStatus SubscriptionStatus @default(trial)
   trialEndsAt        DateTime?
   expiresAt          DateTime?
 
-  // 결제/세금계산서 고지용 필드 (.com에서 고객 안내)
   billingEmail  String?
   lastInvoiceAt DateTime?
 
-  // 데이터 관리(보관/삭제 고지)
   canceledAt           DateTime?
   dataRetentionUntil   DateTime?
   deletionNoticeSentAt DateTime?
@@ -181,35 +193,28 @@ model Company {
   @@index([expiresAt])
 }
 
-model VerificationSession {
-  vid        String    @id @default(uuid())
-  userId     String
-  expiresAt  DateTime
-  createdAt  DateTime  @default(now())
-  verifiedAt DateTime?
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId])
-}
-
 model PasswordResetToken {
   id        String   @id @default(uuid())
+  userId    String
   email     String
-  token     String   @unique
+  token     String // ✅ unique 제거, 대신 인덱스
   expiresAt DateTime
   used      Boolean  @default(false)
   createdAt DateTime @default(now())
 
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
   @@index([email, used])
+  @@index([token, used])
 }
 
 model LoginHistory {
   id        String   @id @default(uuid())
   userId    String
   provider  String
-  ip        String
-  userAgent String
+  ip        String   @db.Text
+  userAgent String   @db.Text
   location  String?
   createdAt DateTime @default(now())
 
@@ -219,12 +224,26 @@ model LoginHistory {
 }
 
 model FcmToken {
-  id        String   @id @default(uuid())
-  token     String   @unique
-  userId    String
-  createdAt DateTime @default(now())
+  id         String    @id @default(uuid())
+  token      String    @unique
+  userId     String
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime? // ✅ 토큰 만료/갱신 관리용 필드 추가
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String
+  action    String // 예: "EMAIL_VERIFIED", "LOGIN_SUCCESS", "PASSWORD_RESET"
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
 }
