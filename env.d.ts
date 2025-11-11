@@ -19,8 +19,6 @@ namespace NodeJS {
     EMAIL_TOKEN_BIND_UA?: "true" | "false";
     EMAIL_TOKEN_TTL_MIN?: string;
     SESSION_CACHE_TTL?: string;
-    WS_PORT?: string;
-    NEXT_PUBLIC_WS_URL?: string;
     FCM_SERVER_KEY?: string;
   }
 }
