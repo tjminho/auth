@@ -30,6 +30,12 @@ const CredentialsSchema = z.object({
   password: z.string().min(1),
 });
 
+function maskEmail(email: string) {
+  const [local, domain] = email.split("@");
+  if (!domain) return email;
+  return local.slice(0, 2) + "***@" + domain;
+}
+
 export const { auth, handlers, signIn, signOut } = NextAuth({
   adapter: CustomAdapter(),
   session: { strategy: "jwt", maxAge: 60 * 60 * 2 },
@@ -104,10 +110,52 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
         const isValid = await compare(password, user.password);
         if (!isValid) return null;
 
-        if (user.status !== UserStatus.ACTIVE)
-          throw new Error("ACCOUNT_SUSPENDED");
+        // ✅ 사용자 상태 분기
+        if (user.status === UserStatus.PENDING) {
+          try {
+            await createAndEmailVerificationToken(user, normalizedEmail);
+            logger.info("authorize: 이메일 미인증 → 인증 메일 재발송", {
+              userId: user.id,
+              email: maskEmail(normalizedEmail),
+            });
+          } catch (err: any) {
+            logger.error("authorize: 인증 메일 재발송 실패", {
+              userId: user.id,
+              error: err?.message,
+            });
+          }
 
-        // 이메일 미인증 계정도 로그인은 허용 → 홈에서 배너로 안내
+          // ✅ 에러 던지지 않고 세션 생성
+          return {
+            id: user.id,
+            email: user.email ?? "",
+            name: user.name ?? null,
+            role: user.role,
+            status: user.status, // PENDING
+            emailVerified: user.emailVerified,
+            trustedEmail: user.trustedEmail,
+            lastProvider: user.lastProvider,
+            subscriptionExpiresAt: user.subscriptionExpiresAt,
+          };
+        }
+
+        if (user.status === UserStatus.SUSPENDED) {
+          throw new Error("ACCOUNT_SUSPENDED");
+        }
+
+        if (user.status === UserStatus.BLOCKED) {
+          throw new Error("ACCOUNT_BLOCKED");
+        }
+
+        if (user.status === UserStatus.DELETED) {
+          throw new Error("ACCOUNT_DELETED");
+        }
+
+        if (user.status !== UserStatus.ACTIVE) {
+          throw new Error("ACCOUNT_INACTIVE");
+        }
+
+        // ✅ ACTIVE 상태만 정상 로그인 허용
         return {
           id: user.id,
           email: user.email ?? "",

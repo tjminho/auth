@@ -31,7 +31,7 @@ export default function VerifyPage() {
   const [rateLimited, setRateLimited] = useState(false);
   const [retryAfter, setRetryAfter] = useState<number>(0);
   const [inputEmail, setInputEmail] = useState("");
-  const [mailSent, setMailSent] = useState(false); // ✅ 발송 성공 여부 상태
+  const [mailSent, setMailSent] = useState(false);
 
   const statusRef = useRef<Status>("init");
   const safeSetStatus = (next: Status) => {
@@ -55,8 +55,7 @@ export default function VerifyPage() {
         toast.success("이메일 인증이 완료되었습니다!");
         try {
           await update();
-        } catch (err) {
-          console.error("세션 갱신 실패", err);
+        } catch {
           router.refresh();
         }
         setTimeout(() => router.replace("/"), 1000);
@@ -81,8 +80,7 @@ export default function VerifyPage() {
         toast.success("이메일 인증이 완료되었습니다!");
         try {
           await update();
-        } catch (err) {
-          console.error("세션 갱신 실패", err);
+        } catch {
           router.refresh();
         }
         setTimeout(() => router.replace("/"), 1000);
@@ -127,10 +125,10 @@ export default function VerifyPage() {
     const trimmed = (targetEmail || "").trim().toLowerCase();
     if (!trimmed) return toast.error("이메일을 입력하세요.");
     if (!isEmailValid(trimmed)) return toast.error("유효한 이메일을 입력하세요.");
+    if (mailSent) return; // ✅ 중복 방지
     setResending(true);
 
     try {
-      // 1️⃣ 먼저 DB에 이메일 업데이트
       const updateRes = await fetch("/api/auth/update-email", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -140,11 +138,14 @@ export default function VerifyPage() {
       const updateData = await updateRes.json().catch(() => ({}));
 
       if (!updateRes.ok) {
-        toast.error(updateData?.message || "이메일 업데이트에 실패했습니다.");
+        if (updateRes.status === 401) {
+          toast.error("로그인 후 이메일 변경이 가능합니다.");
+        } else {
+          toast.error(updateData?.message || "이메일 업데이트에 실패했습니다.");
+        }
         return;
       }
 
-      // 2️⃣ 업데이트 성공 후 인증 메일 발송
       const res = await fetch("/api/auth/resend-verification", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -156,7 +157,7 @@ export default function VerifyPage() {
 
       if (res.ok && (data?.sent === true || data?.code === "MAIL_SENT")) {
         toast.success("인증 메일을 발송했습니다.");
-        setMailSent(true); // ✅ 발송 성공 시 입력폼 숨기기
+        setMailSent(true);
         return;
       }
 
@@ -171,6 +172,12 @@ export default function VerifyPage() {
         return;
       }
 
+      if (data?.code === "ALREADY_VERIFIED") {
+        toast.success("이미 인증된 이메일입니다.");
+        router.replace("/");
+        return;
+      }
+
       toast.error(data?.message || "메일 발송에 실패했습니다.");
     } catch {
       toast.error("서버와의 통신 중 오류가 발생했습니다.");
@@ -178,6 +185,13 @@ export default function VerifyPage() {
       setResending(false);
     }
   }
+
+  // ✅ 최초 진입 시 자동 발송 (신규 가입 케이스)
+  useEffect(() => {
+    if (email && !isPlaceholder && !session?.user?.emailVerified && !mailSent) {
+      handleResend(email);
+    }
+  }, [email, session?.user?.emailVerified, mailSent]);
 
   return (
     <div className="mx-auto max-w-md">
@@ -202,12 +216,13 @@ export default function VerifyPage() {
                   type="email"
                   value={inputEmail}
                   onChange={(e) => setInputEmail(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleResend(inputEmail)}
                   placeholder="실제 이메일 입력"
                   className="w-full border px-3 py-2 rounded"
                 />
                 <Button
                   onClick={() => handleResend(inputEmail)}
-                  disabled={resending || rateLimited}
+                  disabled={resending || rateLimited || mailSent}
                   className="w-full"
                 >
                   {resending ? (
@@ -217,18 +232,26 @@ export default function VerifyPage() {
                     </>
                   ) : rateLimited ? (
                     `재시도 가능까지 ${retryAfter}초`
+                  ) : mailSent ? (
+                    "이미 발송됨"
                   ) : (
                     "인증 메일 보내기"
                   )}
                 </Button>
               </>
             )
+          ) : mailSent ? (
+            <p className="text-sm text-green-600">
+              인증 메일을 발송했습니다. 메일함을 확인해주세요.
+            </p>
           ) : (
             <>
-              <p>메일에서 인증 버튼을 클릭하면 이 창에서 자동으로 완료됩니다.</p>
+              <p className="text-sm text-gray-600">
+                메일에서 인증 버튼을 클릭하면 이 창에서 자동으로 완료됩니다.
+              </p>
               <Button
                 onClick={() => handleResend(email)}
-                disabled={resending || rateLimited}
+                disabled={resending || rateLimited || mailSent}
                 className="w-full"
                 variant="secondary"
               >
@@ -239,6 +262,8 @@ export default function VerifyPage() {
                   </>
                 ) : rateLimited ? (
                   `재시도 가능까지 ${retryAfter}초`
+                ) : mailSent ? (
+                  "이미 발송됨"
                 ) : (
                   "인증 메일 재발송"
                 )}
@@ -246,11 +271,12 @@ export default function VerifyPage() {
             </>
           )}
 
+          {/* 상태 메시지 표시 */}
           {status === "connected" && (
             <p className="text-sm text-gray-600">서버와 연결되었습니다.</p>
           )}
           {status === "waiting" && (
-            <p className="text-sm text-gray-600">인증을 기다리는 중…</p>
+            <p className="text-sm text-gray-600">메일함에서 인증 버튼을 클릭해주세요.</p>
           )}
           {status === "verified" && (
             <p className="text-sm text-green-600">

@@ -24,6 +24,7 @@ import { useSession } from "next-auth/react";
 // ✅ 서버 응답 코드별 메시지 매핑
 const errorMessages: Record<string, string> = {
   EMAIL_IN_USE: "이미 사용 중인 이메일입니다.",
+  EMAIL_NOT_VERIFIED: "이미 가입된 이메일입니다. 인증을 완료해야 로그인할 수 있습니다.",
   INVALID_INPUT: "입력값이 올바르지 않습니다.",
   RATE_LIMITED: "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
   SERVER_ERROR: "서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
@@ -75,7 +76,7 @@ export default function SignupPage() {
       try {
         data = await res.json();
       } catch {
-        // JSON 파싱 실패 시 무시
+        data = {};
       }
 
       if (!res.ok || !data?.success) {
@@ -84,17 +85,25 @@ export default function SignupPage() {
           data?.message ||
           errorMessages.default;
         toast.error(msg);
+
+        // ✅ 이미 가입된 이메일인데 인증 안 된 경우 → signin으로 이동
+        if (data?.error === "EMAIL_NOT_VERIFIED") {
+          router.push("/auth/signin?reason=EMAIL_NOT_VERIFIED");
+          return;
+        }
+
+        // ✅ 기타 redirect 처리
         if (data?.redirect) {
           router.push(data.redirect);
         }
         return;
       }
 
+      // ✅ 신규 가입 성공
       const targetEmail = data?.email || values.email;
-      const vid = data?.vid; // ✅ 서버에서 받은 vid
+      const vid = data?.vid;
       toast.success(`${targetEmail} 주소로 인증 메일을 발송했습니다.`);
 
-      // ✅ vid 포함해서 verify 페이지로 이동
       router.push(
         `/auth/verify?email=${encodeURIComponent(targetEmail)}${
           vid ? `&vid=${encodeURIComponent(vid)}` : ""
@@ -107,7 +116,6 @@ export default function SignupPage() {
     }
   }
 
-  // 세션 로딩 중이면 아무것도 안 보여줌
   if (status === "loading") {
     return null;
   }

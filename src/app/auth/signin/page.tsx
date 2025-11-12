@@ -20,6 +20,7 @@ import { Label } from "@/components/ui/label";
 import Link from "next/link";
 import { GlobalLoading } from "@/components/global-loading";
 import { Route } from "next";
+import { Loader2 } from "lucide-react";
 
 const SignInSchema = z.object({
   email: z.string().email("올바른 이메일 형식이 아닙니다."),
@@ -32,6 +33,8 @@ export default function SignInPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
+  const initialEmail = searchParams.get("email") ?? "";
+
   const [lastOAuth, setLastOAuth] = useState<{
     provider: string | null;
     date: string | null;
@@ -39,7 +42,7 @@ export default function SignInPage() {
 
   const form = useForm<z.infer<typeof SignInSchema>>({
     resolver: zodResolver(SignInSchema),
-    defaultValues: { email: "", password: "" },
+    defaultValues: { email: initialEmail, password: "" },
   });
 
   // ✅ 이미 로그인된 사용자는 홈으로 리다이렉트
@@ -48,6 +51,14 @@ export default function SignInPage() {
       router.replace("/");
     }
   }, [status, router]);
+
+  // ✅ searchParams로 넘어온 이메일을 폼에 반영 (초기화 이후에도)
+  useEffect(() => {
+    const emailParam = searchParams.get("email");
+    if (emailParam) {
+      form.setValue("email", emailParam);
+    }
+  }, [searchParams, form]);
 
   // ✅ 최근 OAuth 로그인 기록 불러오기
   useEffect(() => {
@@ -78,31 +89,32 @@ export default function SignInPage() {
       if (result?.error) {
         form.resetField("password"); // 보안상 비밀번호 초기화
 
-        switch (result.error) {
-          case "EMAIL_NOT_VERIFIED":
-            toast.error("이메일 인증이 필요합니다.", { position: "top-center" });
-            return;
-          case "ACCOUNT_SUSPENDED":
-            toast.error("계정이 정지되었습니다.", { position: "top-center" });
-            return;
-          case "OAuthAccountNotLinked":
-            toast.error(
-              "이미 같은 이메일로 가입된 계정이 있습니다. 기존 계정으로 로그인 후 연결하세요.",
-              { position: "top-center" }
-            );
-            return;
-          default:
-            toast.error("로그인 실패", { position: "top-center" });
-            return;
+        if (result.error === "EMAIL_NOT_VERIFIED") {
+          toast.warning("이메일 인증이 필요하지만 로그인은 진행됩니다.", {
+            position: "top-center",
+          });
+        } else {
+          toast.error("로그인 오류: " + result.error, { position: "top-center" });
         }
       }
 
-      toast.success("로그인 성공!", { position: "top-center" });
-      if (result?.url) {
-        router.push(result.url as Route);
-      } else {
-        router.push("/");
-      }
+toast.success("로그인 성공!", { position: "top-center" });
+
+if (result?.url) {
+  // ✅ 세션 확인 후 미인증이면 verify 페이지로 이동
+  const sessionRes = await fetch("/api/auth/session");
+  const sessionData = await sessionRes.json();
+
+  if (sessionData?.user?.unverified || sessionData?.user?.status === "PENDING") {
+    router.push(`/auth/verify?email=${encodeURIComponent(values.email)}`);
+  } else {
+    router.push(result.url as Route);
+  }
+} else {
+  router.push("/");
+}
+
+      
     } catch (e) {
       toast.error("서버 오류가 발생했습니다.", { position: "top-center" });
     } finally {
@@ -129,6 +141,7 @@ export default function SignInPage() {
                 type="email"
                 autoComplete="email"
                 {...form.register("email")}
+                disabled={loading}
               />
               {form.formState.errors.email && (
                 <p className="text-sm text-red-500">
@@ -144,6 +157,7 @@ export default function SignInPage() {
                 type="password"
                 autoComplete="current-password"
                 {...form.register("password")}
+                disabled={loading}
               />
               {form.formState.errors.password && (
                 <p className="text-sm text-red-500">
@@ -152,6 +166,7 @@ export default function SignInPage() {
               )}
             </div>
             <Button type="submit" className="w-full" disabled={loading}>
+              {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {loading ? "로그인 중..." : "로그인"}
             </Button>
           </form>

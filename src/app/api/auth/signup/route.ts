@@ -6,20 +6,24 @@ import { createAndEmailVerificationToken } from "@/lib/verification";
 import { UserStatus } from "@prisma/client";
 import { hit } from "@/lib/rate-limit";
 import { logger } from "@/lib/logger";
-import { randomUUID } from "crypto"; // ✅ SSE용 vid 생성
+
+// 이메일 로그 마스킹 유틸
+function maskEmail(email: string) {
+  const [local, domain] = email.split("@");
+  if (!domain) return email;
+  return local.slice(0, 2) + "***@" + domain;
+}
 
 export async function POST(req: Request) {
   try {
+    // 1) 입력값 검증
     const body = await req.json().catch(() => ({}));
-
-    // 1. 입력값 검증
     const parsed = signupSchema.safeParse(body);
     if (!parsed.success) {
       const firstError =
         parsed.error.flatten().formErrors[0] ??
         Object.values(parsed.error.flatten().fieldErrors)[0]?.[0] ??
         "잘못된 입력값입니다.";
-
       return NextResponse.json(
         {
           success: false,
@@ -31,18 +35,18 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 이메일 전처리
+    // 2) 이메일/비밀번호/이름 전처리
     const email = parsed.data.email.trim().toLowerCase();
     const password = parsed.data.password;
     const name = parsed.data.name?.trim();
 
-    // 2. 요청 제한
+    // 3) 레이트 리밋
     const ipHeader = req.headers.get("x-forwarded-for") ?? "";
     const ip = ipHeader.split(",")[0].trim() || "unknown";
     const ua = req.headers.get("user-agent") ?? undefined;
 
     const limit = await hit(ip, email);
-    if (limit.limited) {
+    if (!limit.allowed) {
       logger.warn("회원가입 요청 제한 초과", {
         email: maskEmail(email),
         ip,
@@ -61,118 +65,134 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3. 이메일 중복 체크
+    // 4) 기존 계정 조회
     const existing = await prisma.user.findFirst({
       where: { OR: [{ trustedEmail: email }, { email }] },
+      select: {
+        id: true,
+        email: true,
+        trustedEmail: true,
+        password: true,
+        emailVerified: true,
+        status: true,
+        provider: true,
+      },
     });
 
     if (existing) {
-      if (!existing.emailVerified || existing.status === UserStatus.PENDING) {
+      const isOAuthOnly =
+        !existing.password &&
+        !!existing.provider &&
+        existing.provider !== "credentials";
+
+      const needVerify =
+        !existing.emailVerified || existing.status === UserStatus.PENDING;
+      const reason = needVerify ? "need_verify" : "duplicate";
+      const redirect = `/auth/signin?email=${encodeURIComponent(email)}&reason=${
+        needVerify ? "EMAIL_NOT_VERIFIED" : "EMAIL_IN_USE"
+      }`;
+
+      if (isOAuthOnly) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: "OAUTH_ACCOUNT_EXISTS",
+            reason,
+            message:
+              "이미 소셜 계정으로 가입되어 있습니다. 로그인 페이지에서 소셜 로그인을 진행해주세요.",
+            email,
+            redirect,
+          },
+          { status: 409 }
+        );
+      }
+
+      if (needVerify) {
         return NextResponse.json(
           {
             success: false,
             error: "EMAIL_IN_USE",
             reason: "need_verify",
             message: "이미 가입된 이메일입니다. 로그인 후 인증을 완료해주세요.",
-            redirect: "/auth/signin",
             email,
+            redirect,
           },
-          { status: 400 }
+          { status: 409 }
         );
       }
+
       return NextResponse.json(
         {
           success: false,
           error: "EMAIL_IN_USE",
           reason: "duplicate",
           message: "이미 가입된 이메일입니다.",
-          redirect: "/auth/signin",
+          email,
+          redirect,
         },
-        { status: 400 }
+        { status: 409 }
       );
     }
 
-    // 4. 비밀번호 해시
+    // 5) 비밀번호 해시
     const hashedPassword = await hash(password, 12);
 
-    // 5. 사용자 생성
-    let newUser;
-    try {
-      newUser = await prisma.user.create({
-        data: {
-          email,
-          trustedEmail: null,
-          emailVerified: null,
-          password: hashedPassword,
-          name,
-          status: UserStatus.PENDING,
-          role: "USER",
-        },
-      });
-    } catch (dbError: any) {
-      if (dbError.code === "P2002") {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "EMAIL_IN_USE",
-            reason: "duplicate",
-            message: "이미 가입된 이메일입니다.",
-            redirect: "/auth/signin",
-          },
-          { status: 400 }
-        );
-      }
-      logger.error("회원가입 DB 오류", { error: dbError?.message });
-      throw dbError;
+    // 6) 신규 사용자 생성
+    const newUser = await prisma.user.create({
+      data: {
+        email,
+        trustedEmail: null,
+        emailVerified: null,
+        password: hashedPassword,
+        name,
+        status: UserStatus.PENDING,
+        role: "USER",
+        provider: "credentials",
+      },
+    });
+
+    // 7) 인증 토큰 발급 + 메일 발송
+    const verifyResult = await createAndEmailVerificationToken(newUser, email);
+
+    // 8) redirect 안전 처리
+    let redirect: string;
+    if (verifyResult.code === "EMAIL_SENT" && verifyResult.vid) {
+      redirect = `/auth/verify?email=${encodeURIComponent(email)}&vid=${encodeURIComponent(verifyResult.vid)}`;
+    } else {
+      redirect = `/auth/verify?email=${encodeURIComponent(email)}`;
     }
 
-    // 6. VerificationSession 생성 + 인증 메일 발송
-    let vid: string | null = null;
-    try {
-      // ✅ SSE용 vid 생성 (UUID)
-      vid = randomUUID();
-
-      await prisma.verificationSession.create({
-        data: {
+    // 9) 응답 반환
+    if (verifyResult.code === "EMAIL_SENT") {
+      return NextResponse.json(
+        {
+          success: true,
+          code: "SIGNUP_SUCCESS",
+          message: "회원가입이 완료되었습니다. 인증 메일을 확인해주세요.",
           userId: newUser.id,
-          vid,
-          createdAt: new Date(),
+          email,
+          redirect,
         },
-      });
-
-      // ✅ vid를 메일 발송 함수에 전달
-      await createAndEmailVerificationToken(newUser, email, { ip, ua, vid });
-
-      logger.info("회원가입 인증 메일 발송 성공", {
-        email: maskEmail(email),
-        ip,
-        vid,
-      });
-    } catch (mailError: any) {
+        { status: 201 }
+      );
+    } else {
       logger.error("회원가입 인증 메일 발송 실패", {
         email: maskEmail(email),
-        error: mailError?.message,
+        code: verifyResult.code,
       });
       return NextResponse.json(
         {
-          success: false,
-          error: "MAIL_SEND_FAILED",
+          success: true,
+          code: verifyResult.code,
           message:
-            "가입은 완료되었지만 인증 메일 발송에 실패했습니다. 관리자에게 문의하세요.",
+            "가입은 완료되었지만 인증 메일 발송에 실패했습니다. 잠시 후 다시 시도하거나 인증 메일 재발송을 진행해주세요.",
           userId: newUser.id,
           email,
+          redirect,
         },
-        { status: 500 }
+        { status: 202 }
       );
     }
-
-    return NextResponse.json({
-      success: true,
-      message: "가입 완료. 이메일 인증을 진행해주세요.",
-      userId: newUser.id,
-      email,
-      vid, // ✅ 프론트에서 verify 페이지 이동 시 사용
-    });
   } catch (error: any) {
     logger.error("회원가입 처리 중 오류", {
       message: error?.message,
@@ -188,11 +208,4 @@ export async function POST(req: Request) {
       { status: 500 }
     );
   }
-}
-
-// ✅ 이메일 로그 마스킹 유틸
-function maskEmail(email: string) {
-  const [local, domain] = email.split("@");
-  if (!domain) return email;
-  return local.slice(0, 2) + "***@" + domain;
 }
