@@ -98,7 +98,7 @@ export default function SignInPage() {
         }
       }
 
-toast.success("로그인 성공!", { position: "top-center" });
+// toast.success("로그인 성공!", { position: "top-center" });
 
 if (result?.url) {
   // ✅ 세션 확인 후 미인증이면 verify 페이지로 이동
