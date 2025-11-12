@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { createAndEmailVerificationToken } from "@/lib/verification";
 import { hitEmail } from "@/lib/rate-limit";
 import { logger } from "@/lib/logger";
+import type { VerifyResult } from "@/lib/verification-types";
 
 // ✅ 인증 쿠키 제거 유틸
 function clearAuthCookies(response: NextResponse) {
@@ -28,10 +29,10 @@ export async function POST(req: Request) {
     const ua = req.headers.get("user-agent") ?? undefined;
 
     // ✅ 이메일 유효성 체크
-    if (!email || typeof email !== "string") {
-      logger.warn("재발송 요청 실패: 이메일 누락", { ip, ua });
+    if (!email || typeof email !== "string" || !email.includes("@")) {
+      logger.warn("재발송 요청 실패: 이메일 누락/형식 오류", { ip, ua });
       return NextResponse.json(
-        { code: "EMAIL_REQUIRED", message: "이메일이 필요합니다." },
+        { code: "EMAIL_REQUIRED", message: "올바른 이메일이 필요합니다." },
         { status: 400 }
       );
     }
@@ -39,18 +40,22 @@ export async function POST(req: Request) {
 
     // ✅ Rate Limit 체크
     const limit = await hitEmail(ip, normalizedEmail).catch((err) => {
-      logger.error("Rate-limit 체크 실패", { error: err?.message, ip, email });
+      logger.error("Rate-limit 체크 실패", {
+        error: err?.message,
+        ip,
+        email: normalizedEmail,
+      });
       return {
-        limited: false,
+        allowed: true,
         remaining: 1,
         reset: 60,
         count: 0,
         limit: 1,
         retryAfter: 0,
-      }; // ✅ 항상 동일한 구조 반환
+      };
     });
 
-    if (limit.limited) {
+    if (!limit.allowed) {
       logger.warn("재발송 요청 Rate Limit 초과", {
         email: maskEmail(normalizedEmail),
         ip,
@@ -67,10 +72,11 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 유저 조회
+    // ✅ 유저 조회 (삭제된 계정 제외)
     const user = await prisma.user.findFirst({
       where: {
         OR: [{ trustedEmail: normalizedEmail }, { email: normalizedEmail }],
+        deletedAt: null,
       },
     });
 
@@ -98,8 +104,13 @@ export async function POST(req: Request) {
       );
     }
 
-    const targetEmail = user.trustedEmail ?? user.email;
-    if (!targetEmail) {
+    // ✅ placeholder.local → trustedEmail 기준
+    const targetEmail =
+      user.trustedEmail && !user.trustedEmail.endsWith("@placeholder.local")
+        ? user.trustedEmail
+        : user.email;
+
+    if (!targetEmail || targetEmail.endsWith("@placeholder.local")) {
       logger.error("재발송 실패: 발송 대상 이메일 없음", { userId: user.id });
       return NextResponse.json(
         {
@@ -111,19 +122,39 @@ export async function POST(req: Request) {
     }
 
     // ✅ VerificationSession 생성 + 메일 발송
-    const { vid } = await createAndEmailVerificationToken(user, targetEmail);
+    const result: VerifyResult = await createAndEmailVerificationToken(
+      user,
+      targetEmail
+    );
 
-    logger.info("재발송 성공", {
-      userId: user.id,
-      email: maskEmail(targetEmail),
-      vid,
-      ip,
-      ua,
-    });
+    if (result.code === "EMAIL_SENT") {
+      logger.info("재발송 성공", {
+        userId: user.id,
+        email: maskEmail(targetEmail),
+        vid: result.vid,
+        ip,
+        ua,
+      });
 
+      return NextResponse.json(
+        {
+          code: "MAIL_SENT",
+          message: "인증 메일을 발송했습니다.",
+          vid: result.vid,
+          email: targetEmail,
+          userId: user.id,
+        },
+        { status: 200 }
+      );
+    }
+
+    // 다른 케이스 처리 (예: RESEND_FAILED, INVALID_EMAIL 등)
     return NextResponse.json(
-      { code: "MAIL_SENT", vid, email: targetEmail, userId: user.id },
-      { status: 200 }
+      {
+        ...result,
+        message: result.message ?? "재발송 처리 중 오류가 발생했습니다.",
+      },
+      { status: 400 }
     );
   } catch (err: any) {
     logger.error("재발송 처리 중 서버 오류", {

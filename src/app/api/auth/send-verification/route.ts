@@ -5,6 +5,7 @@ import { hit } from "@/lib/rate-limit";
 import { logger } from "@/lib/logger";
 import { auth } from "@/auth";
 import { User } from "@prisma/client";
+import type { VerifyResult } from "@/lib/verification-types";
 
 function isRealEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim().toLowerCase());
@@ -39,15 +40,16 @@ export async function POST(req: Request) {
     const limit = await hit(ip, email).catch((err) => {
       logger.error("Rate-limit 체크 실패", { error: err?.message, ip, email });
       return {
-        limited: false,
+        allowed: true,
         remaining: 1,
         reset: 60,
         count: 0,
         limit: 1,
         retryAfter: 0,
-      }; // ✅ 항상 동일한 구조 반환
+      };
     });
-    if (limit.limited) {
+
+    if (!limit.allowed) {
       return NextResponse.json(
         {
           code: "RATE_LIMITED",
@@ -62,6 +64,7 @@ export async function POST(req: Request) {
     const session = await auth().catch(() => null);
     const sessionUserId = session?.user?.id;
     if (!sessionUserId) {
+      logger.warn("인증 메일 발송 실패: 로그인 필요", { ip, ua });
       return NextResponse.json(
         { code: "UNAUTHORIZED", message: "로그인이 필요합니다." },
         { status: 401 }
@@ -109,38 +112,56 @@ export async function POST(req: Request) {
 
     // ✅ 유저 없음 → 존재 노출 방지
     if (!user) {
-      return NextResponse.json({ code: "USER_NOT_FOUND" }, { status: 200 });
+      logger.warn("인증 메일 발송 실패: 유저 없음", { email, ip });
+      return NextResponse.json(
+        { code: "USER_NOT_FOUND", message: "계정을 찾을 수 없습니다." },
+        { status: 200 }
+      );
     }
 
     // ✅ 이미 인증된 경우 → 존재 노출 방지
     if (user.emailVerified) {
-      return NextResponse.json({ code: "ALREADY_VERIFIED" }, { status: 200 });
+      return NextResponse.json(
+        { code: "ALREADY_VERIFIED", message: "이미 인증된 계정입니다." },
+        { status: 200 }
+      );
     }
 
     // ✅ 인증 메일 발송
     try {
-      const { token, vid } = await createAndEmailVerificationToken(
+      const result: VerifyResult = await createAndEmailVerificationToken(
         user,
         targetEmail
       );
 
-      logger.info("인증 메일 발송 성공", {
-        userId: user.id,
-        targetEmail,
-        ip,
-        ua,
-        vid,
-      });
+      if (result.code === "EMAIL_SENT") {
+        logger.info("인증 메일 발송 성공", {
+          userId: user.id,
+          targetEmail,
+          ip,
+          ua,
+          vid: result.vid,
+        });
 
+        return NextResponse.json(
+          {
+            code: "MAIL_SENT",
+            sent: true,
+            vid: result.vid,
+            email: targetEmail,
+            userId: user.id,
+          },
+          { status: 200 }
+        );
+      }
+
+      // 다른 케이스 처리 (예: RATE_LIMITED, RESEND_FAILED 등)
       return NextResponse.json(
         {
-          code: "MAIL_SENT",
-          sent: true, // ✅ 프론트 호환을 위해 추가
-          vid,
-          email: targetEmail,
-          userId: user.id,
+          ...result,
+          message: result.message ?? "인증 메일 발송에 실패했습니다.",
         },
-        { status: 200 }
+        { status: 400 }
       );
     } catch (err: any) {
       const msg = err?.message || "";

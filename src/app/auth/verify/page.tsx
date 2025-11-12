@@ -30,6 +30,8 @@ export default function VerifyPage() {
   const [resending, setResending] = useState(false);
   const [rateLimited, setRateLimited] = useState(false);
   const [retryAfter, setRetryAfter] = useState<number>(0);
+  const [inputEmail, setInputEmail] = useState("");
+  const [mailSent, setMailSent] = useState(false); // ✅ 발송 성공 여부 상태
 
   const statusRef = useRef<Status>("init");
   const safeSetStatus = (next: Status) => {
@@ -55,6 +57,7 @@ export default function VerifyPage() {
           await update();
         } catch (err) {
           console.error("세션 갱신 실패", err);
+          router.refresh();
         }
         setTimeout(() => router.replace("/"), 1000);
       }
@@ -65,18 +68,12 @@ export default function VerifyPage() {
 
   // ✅ SSE 연결
   useEffect(() => {
-    if (!vid) {
-      safeSetStatus("error");
-      toast.error("잘못된 인증 링크입니다.");
-      return;
-    }
+    if (!vid) return;
 
     const es = new EventSource(`/api/auth/verification-stream?vid=${vid}`);
     safeSetStatus("connected");
 
-    es.addEventListener("connected", () => {
-      safeSetStatus("waiting");
-    });
+    es.addEventListener("connected", () => safeSetStatus("waiting"));
 
     es.addEventListener("verified", async () => {
       if (statusRef.current !== "verified") {
@@ -86,6 +83,7 @@ export default function VerifyPage() {
           await update();
         } catch (err) {
           console.error("세션 갱신 실패", err);
+          router.refresh();
         }
         setTimeout(() => router.replace("/"), 1000);
       }
@@ -99,7 +97,6 @@ export default function VerifyPage() {
       es.close();
     });
 
-    // ✅ 타임아웃 처리 (예: 10분)
     const timeout = setTimeout(() => {
       if (statusRef.current !== "verified") {
         safeSetStatus("timeout");
@@ -125,7 +122,7 @@ export default function VerifyPage() {
   const isEmailValid = (val: string) =>
     /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val) && !val.endsWith("@placeholder.local");
 
-  // ✅ 인증 메일 재발송
+  // ✅ 이메일 업데이트 + 인증 메일 발송
   async function handleResend(targetEmail: string) {
     const trimmed = (targetEmail || "").trim().toLowerCase();
     if (!trimmed) return toast.error("이메일을 입력하세요.");
@@ -133,6 +130,21 @@ export default function VerifyPage() {
     setResending(true);
 
     try {
+      // 1️⃣ 먼저 DB에 이메일 업데이트
+      const updateRes = await fetch("/api/auth/update-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ email: trimmed }),
+      });
+      const updateData = await updateRes.json().catch(() => ({}));
+
+      if (!updateRes.ok) {
+        toast.error(updateData?.message || "이메일 업데이트에 실패했습니다.");
+        return;
+      }
+
+      // 2️⃣ 업데이트 성공 후 인증 메일 발송
       const res = await fetch("/api/auth/resend-verification", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -144,14 +156,14 @@ export default function VerifyPage() {
 
       if (res.ok && (data?.sent === true || data?.code === "MAIL_SENT")) {
         toast.success("인증 메일을 발송했습니다.");
+        setMailSent(true); // ✅ 발송 성공 시 입력폼 숨기기
         return;
       }
 
       if (data?.code === "RATE_LIMITED") {
         setRateLimited(true);
         setRetryAfter(data?.retryAfter || 60);
-        toast.error(`요청이 너무 많습니다. ${retryAfter}초 후 다시 시도해주세요.`);
-        // 자동으로 버튼 활성화
+        toast.error(`요청이 너무 많습니다. ${data?.retryAfter || 60}초 후 다시 시도해주세요.`);
         setTimeout(() => {
           setRateLimited(false);
           setRetryAfter(0);
@@ -179,7 +191,39 @@ export default function VerifyPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {!isPlaceholder && (
+          {isPlaceholder ? (
+            mailSent ? (
+              <p className="text-sm text-green-600">
+                인증 메일을 발송했습니다. 메일함을 확인해주세요.
+              </p>
+            ) : (
+              <>
+                <input
+                  type="email"
+                  value={inputEmail}
+                  onChange={(e) => setInputEmail(e.target.value)}
+                  placeholder="실제 이메일 입력"
+                  className="w-full border px-3 py-2 rounded"
+                />
+                <Button
+                  onClick={() => handleResend(inputEmail)}
+                  disabled={resending || rateLimited}
+                  className="w-full"
+                >
+                  {resending ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      발송 중...
+                    </>
+                  ) : rateLimited ? (
+                    `재시도 가능까지 ${retryAfter}초`
+                  ) : (
+                    "인증 메일 보내기"
+                  )}
+                </Button>
+              </>
+            )
+          ) : (
             <>
               <p>메일에서 인증 버튼을 클릭하면 이 창에서 자동으로 완료됩니다.</p>
               <Button

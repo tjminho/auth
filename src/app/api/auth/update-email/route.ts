@@ -1,67 +1,86 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { auth } from "@/auth";
 import { logger } from "@/lib/logger";
-
-function maskEmail(email: string) {
-  const [local, domain] = email.split("@");
-  return local.slice(0, 3) + "***@" + domain;
-}
 
 export async function POST(req: Request) {
   try {
-    const { userId, email } = await req.json();
-    if (!userId || !email) {
+    const session = await auth().catch(() => null);
+    const body = await req.json().catch(() => ({}));
+    const email = (body?.email || "").trim().toLowerCase();
+
+    // ✅ 로그인 확인
+    if (!session?.user?.id) {
+      logger.warn("이메일 업데이트 실패: 로그인 필요");
       return NextResponse.json(
-        {
-          success: false,
-          code: "INVALID_INPUT",
-          message: "userId와 email이 필요합니다.",
-        },
+        { code: "UNAUTHORIZED", message: "로그인이 필요합니다." },
+        { status: 401 }
+      );
+    }
+
+    // ✅ 이메일 형식 검증
+    const isValid =
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) &&
+      !email.endsWith("@placeholder.local");
+
+    if (!isValid) {
+      logger.warn("잘못된 이메일 형식", { email });
+      return NextResponse.json(
+        { code: "INVALID_EMAIL", message: "올바른 이메일 주소를 입력하세요." },
         { status: 400 }
       );
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
-
-    // ✅ 유저 조회
-    const user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
+    // ✅ 다른 계정에서 이미 사용 중인지 검사
+    const duplicate = await prisma.user.findFirst({
+      where: {
+        OR: [{ trustedEmail: email }, { email }],
+        NOT: { id: session.user.id },
+        deletedAt: null,
+      },
+    });
+    if (duplicate) {
+      logger.warn("이메일 업데이트 실패: 다른 계정에서 사용 중", { email });
       return NextResponse.json(
         {
-          success: false,
-          code: "USER_NOT_FOUND",
-          message: "해당 유저를 찾을 수 없습니다.",
+          code: "EMAIL_IN_USE",
+          message: "이미 다른 계정에서 사용 중인 이메일입니다.",
         },
-        { status: 404 }
+        { status: 409 }
       );
     }
 
-    // ✅ trustedEmail 업데이트 + 필요 시 emailVerified 리셋
+    // ✅ 현재 유저 업데이트
     const updated = await prisma.user.update({
-      where: { id: userId },
+      where: { id: session.user.id },
       data: {
-        trustedEmail: normalizedEmail,
-        emailVerified: null,
-        updatedAt: new Date(),
+        email,
+        trustedEmail: email,
+        emailVerified: null, // 새 이메일은 다시 인증 필요
       },
     });
 
-    logger.info("trustedEmail 업데이트 성공", {
+    logger.info("이메일 업데이트 성공", {
       userId: updated.id,
-      email: maskEmail(normalizedEmail),
+      email: updated.email,
     });
 
-    return NextResponse.json({
-      success: true,
-      code: "EMAIL_UPDATED",
-      message: "이메일이 업데이트되었습니다.",
-      userId: updated.id,
-      trustedEmail: updated.trustedEmail,
-    });
-  } catch (err: any) {
-    logger.error("trustedEmail 업데이트 실패", { message: err?.message });
     return NextResponse.json(
-      { success: false, code: "SERVER_ERROR", message: "이메일 업데이트 실패" },
+      {
+        code: "EMAIL_UPDATED",
+        message: "이메일이 성공적으로 업데이트되었습니다.",
+        email: updated.email,
+        userId: updated.id,
+      },
+      { status: 200 }
+    );
+  } catch (err: any) {
+    logger.error("이메일 업데이트 처리 중 서버 오류", {
+      message: err?.message,
+      stack: err?.stack,
+    });
+    return NextResponse.json(
+      { code: "SERVER_ERROR", message: err?.message ?? "서버 오류" },
       { status: 500 }
     );
   }
