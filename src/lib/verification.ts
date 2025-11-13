@@ -22,6 +22,7 @@ const EMAIL_TTL_MIN = Number(process.env.EMAIL_TOKEN_TTL_MIN ?? 15);
 const RESET_TTL_MIN = Number(process.env.PASSWORD_RESET_TTL_MIN ?? 30);
 const SECRET = new TextEncoder().encode(process.env.EMAIL_TOKEN_SECRET!);
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL!;
+const RESEND_API_KEY = process.env.RESEND_API_KEY!;
 const FROM_EMAIL = process.env.FROM_EMAIL!;
 const RESEND_COOLDOWN_MS = Number(
   process.env.VERIFICATION_COOLDOWN_MS ?? 60_000
@@ -90,16 +91,18 @@ export async function createAndEmailVerificationToken(
   user: User,
   targetEmailRaw: string
 ): Promise<VerifyResult> {
-  if (!user?.id) return { code: "USER_ID_REQUIRED" };
+  if (!user?.id) return { success: false, code: "USER_ID_REQUIRED" };
 
   const targetEmail = normalizeEmail(targetEmailRaw);
   if (!isEmailValid(targetEmail)) {
-    return { code: "INVALID_EMAIL", email: targetEmail };
+    return { success: false, code: "INVALID_EMAIL", email: targetEmail };
   }
 
-  if (!FROM_EMAIL || !APP_URL) {
-    logger.error("환경 변수 미설정: FROM_EMAIL 또는 APP_URL 없음");
-    return { code: "RESEND_FAILED", email: targetEmail };
+  if (!FROM_EMAIL || !APP_URL || !RESEND_API_KEY) {
+    logger.error(
+      "환경 변수 미설정: FROM_EMAIL, APP_URL 또는 RESEND_API_KEY 없음"
+    );
+    return { success: false, code: "RESEND_FAILED", email: targetEmail };
   }
 
   const expiresAt = addMinutes(new Date(), EMAIL_TTL_MIN);
@@ -107,9 +110,15 @@ export async function createAndEmailVerificationToken(
   // 이미 인증된 계정
   if (
     user.emailVerified != null &&
-    normalizeEmail(user.trustedEmail ?? "") === targetEmail
+    (normalizeEmail(user.trustedEmail ?? "") === targetEmail ||
+      normalizeEmail(user.email ?? "") === targetEmail)
   ) {
-    return { code: "ALREADY_VERIFIED", email: targetEmail, userId: user.id };
+    return {
+      success: true,
+      code: "ALREADY_VERIFIED",
+      email: targetEmail,
+      userId: user.id,
+    };
   }
 
   // Rate-limit 체크
@@ -123,7 +132,12 @@ export async function createAndEmailVerificationToken(
         (now.getTime() - user.lastVerificationSentAt.getTime())) /
         1000
     );
-    return { code: "RATE_LIMITED", retryAfter, email: targetEmail };
+    return {
+      success: false,
+      code: "RATE_LIMITED",
+      retryAfter,
+      email: targetEmail,
+    };
   }
 
   // Daily-limit 체크
@@ -138,7 +152,7 @@ export async function createAndEmailVerificationToken(
     },
   });
   if (todayCount >= DAILY_LIMIT) {
-    return { code: "DAILY_LIMIT_EXCEEDED", email: targetEmail };
+    return { success: false, code: "DAILY_LIMIT_EXCEEDED", email: targetEmail };
   }
 
   // 기존 토큰/세션 정리 후 새로 생성
@@ -196,11 +210,14 @@ export async function createAndEmailVerificationToken(
     });
   } catch (err: any) {
     logger.error("메일 발송 실패", { error: err?.message });
-    await prisma.verification.update({
-      where: { id: verification.id },
-      data: { consumedAt: new Date() },
+    await prisma.$transaction(async (tx) => {
+      await tx.verification.update({
+        where: { id: verification.id },
+        data: { consumedAt: new Date() },
+      });
+      await tx.verificationSession.delete({ where: { vid: session.vid } });
     });
-    return { code: "RESEND_FAILED", email: targetEmail };
+    return { success: false, code: "RESEND_FAILED", email: targetEmail };
   }
 
   await prisma.user.update({
@@ -210,6 +227,7 @@ export async function createAndEmailVerificationToken(
 
   // ✅ 최종 응답: EMAIL_SENT 케이스
   return {
+    success: true,
     code: "EMAIL_SENT",
     vid: session.vid,
     email: targetEmail,

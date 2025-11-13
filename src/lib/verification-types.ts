@@ -20,49 +20,25 @@ export type VerifyErrorCode =
   | "DAILY_LIMIT_EXCEEDED"
   | "VERIFIED";
 
-/**
- * 모든 응답에 공통적으로 포함될 수 있는 필드
- * - message는 선택적으로 항상 허용
- */
-type VerifyBase = {
+/* ================================
+   공통 응답 필드 정의
+================================ */
+export interface VerifyBase {
+  success: boolean; // ✅ 필수로 변경
+  code: VerifyErrorCode; // ✅ 모든 응답에 코드 포함
+  message?: string;
   email?: string;
   vid?: string;
   userId?: string;
-  message?: string;
-};
+  retryAfter?: number; // Rate-limit 관련
+  token?: string; // Reset-token 관련
+}
 
 /* ================================
    응답 타입 정의
+   - 모든 응답은 VerifyBase 기반
 ================================ */
-export type VerifyResult =
-  | (VerifyBase & { code: "EXPIRED" })
-  | (VerifyBase & { code: "INVALID_SIGNATURE" })
-  | (VerifyBase & { code: "NOT_FOUND" })
-  | (VerifyBase & { code: "USER_NOT_FOUND" })
-  | (VerifyBase & { code: "RATE_LIMITED"; retryAfter: number })
-  | (VerifyBase & { code: "DAILY_LIMIT_EXCEEDED"; retryAfter?: number })
-  | (VerifyBase & { code: "INVALID_EMAIL" })
-  | (VerifyBase & { code: "RESEND_FAILED" })
-  | (VerifyBase & {
-      code: "EMAIL_SENT";
-      vid: string;
-      email: string;
-      userId: string;
-    })
-  | (VerifyBase & {
-      code: "VERIFIED";
-      email: string;
-      userId: string;
-      vid: string;
-    })
-  | (VerifyBase & {
-      code: "ALREADY_VERIFIED";
-      email: string;
-      userId: string;
-    })
-  | { code: "RESET_TOKEN_NOT_FOUND"; token: string; message?: string }
-  | { code: "RESET_TOKEN_EXPIRED"; token: string; message?: string }
-  | { code: "USER_ID_REQUIRED"; message?: string };
+export type VerifyResult = VerifyBase;
 
 /* ================================
    토큰 페이로드 정의

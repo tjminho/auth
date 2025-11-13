@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { auth } from "@/auth";
 import { logger } from "@/lib/logger";
+import { sendVerificationEmail } from "@/lib/mail";
 
 export async function POST(req: Request) {
   try {
@@ -60,6 +61,18 @@ export async function POST(req: Request) {
       },
     });
 
+    // ✅ 인증 세션 생성 + 메일 발송
+    const verificationSession = await prisma.verificationSession.create({
+      data: {
+        userId: updated.id,
+        email,
+        type: "EMAIL",
+        expiresAt: new Date(Date.now() + 1000 * 60 * 30), // 30분 유효
+      },
+    });
+
+    await sendVerificationEmail(email, updated.id, verificationSession.vid);
+
     logger.info("이메일 업데이트 성공", {
       userId: updated.id,
       email: updated.email,
@@ -68,7 +81,8 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         code: "EMAIL_UPDATED",
-        message: "이메일이 성공적으로 업데이트되었습니다.",
+        message:
+          "이메일이 성공적으로 업데이트되었습니다. 인증 메일을 확인하세요.",
         email: updated.email,
         userId: updated.id,
       },
@@ -80,7 +94,7 @@ export async function POST(req: Request) {
       stack: err?.stack,
     });
     return NextResponse.json(
-      { code: "SERVER_ERROR", message: err?.message ?? "서버 오류" },
+      { code: "SERVER_ERROR", message: "서버 오류가 발생했습니다." },
       { status: 500 }
     );
   }

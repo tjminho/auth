@@ -11,7 +11,7 @@ import { logger } from "@/lib/logger";
 import { createAndEmailVerificationToken } from "@/lib/verification";
 import { compare } from "bcryptjs";
 import { getGeoLocation } from "@/lib/geoip";
-import { sendLoginAlertEmail } from "@/lib/mail";
+import { sendLoginAlertEmail, sendVerificationEmail } from "@/lib/mail";
 import { z } from "zod";
 import { SignJWT, jwtVerify } from "jose";
 import type { JWT } from "next-auth/jwt";
@@ -42,7 +42,6 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
   trustHost: true,
   secret: AUTH_SECRET,
 
-  // ✅ JWT encode/decode 오버라이드
   jwt: {
     async encode({ token, secret }) {
       if (!token) return "";
@@ -110,7 +109,6 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
         const isValid = await compare(password, user.password);
         if (!isValid) return null;
 
-        // ✅ 사용자 상태 분기
         if (user.status === UserStatus.PENDING) {
           try {
             await createAndEmailVerificationToken(user, normalizedEmail);
@@ -124,54 +122,83 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
               error: err?.message,
             });
           }
-
-          // ✅ 에러 던지지 않고 세션 생성
-          return {
-            id: user.id,
-            email: user.email ?? "",
-            name: user.name ?? null,
-            role: user.role,
-            status: user.status, // PENDING
-            emailVerified: user.emailVerified,
-            trustedEmail: user.trustedEmail,
-            lastProvider: user.lastProvider,
-            subscriptionExpiresAt: user.subscriptionExpiresAt,
-          };
+          return { ...user };
         }
 
-        if (user.status === UserStatus.SUSPENDED) {
+        if (user.status === UserStatus.SUSPENDED)
           throw new Error("ACCOUNT_SUSPENDED");
-        }
-
-        if (user.status === UserStatus.BLOCKED) {
+        if (user.status === UserStatus.BLOCKED)
           throw new Error("ACCOUNT_BLOCKED");
-        }
-
-        if (user.status === UserStatus.DELETED) {
+        if (user.status === UserStatus.DELETED)
           throw new Error("ACCOUNT_DELETED");
-        }
-
-        if (user.status !== UserStatus.ACTIVE) {
+        if (user.status !== UserStatus.ACTIVE)
           throw new Error("ACCOUNT_INACTIVE");
-        }
 
-        // ✅ ACTIVE 상태만 정상 로그인 허용
-        return {
-          id: user.id,
-          email: user.email ?? "",
-          name: user.name ?? null,
-          role: user.role,
-          status: user.status,
-          emailVerified: user.emailVerified,
-          trustedEmail: user.trustedEmail,
-          lastProvider: user.lastProvider,
-          subscriptionExpiresAt: user.subscriptionExpiresAt,
-        };
+        return { ...user };
       },
     }),
   ],
 
   callbacks: {
+    async signIn({ user, account }) {
+      // ✅ OAuth 로그인 시 병합/redirect 처리
+      if (account && account.type === "oauth") {
+        const email = user?.email?.toLowerCase();
+        if (!email) return false;
+
+        const existingUser = await prisma.user.findFirst({
+          where: { OR: [{ email }, { trustedEmail: email }] },
+        });
+
+        if (existingUser) {
+          if (existingUser.emailVerified) {
+            // 병합: Account 연결
+            await prisma.account.upsert({
+              where: {
+                provider_providerAccountId: {
+                  provider: account.provider,
+                  providerAccountId: account.providerAccountId!,
+                },
+              },
+              update: {},
+              create: {
+                userId: existingUser.id,
+                provider: account.provider,
+                providerAccountId: account.providerAccountId!,
+                type: account.type,
+                email,
+              },
+            });
+            return true;
+          } else {
+            // 미인증 → VerificationSession 생성 후 메일 발송
+            const verificationSession = await prisma.verificationSession.create(
+              {
+                data: {
+                  userId: existingUser.id,
+                  email,
+                  type: "EMAIL",
+                  expiresAt: new Date(Date.now() + 1000 * 60 * 30), // 30분 유효
+                },
+              }
+            );
+
+            await sendVerificationEmail(
+              email,
+              existingUser.id,
+              verificationSession.vid
+            );
+
+            // Verify 페이지로 redirect
+            throw new Error(
+              `REDIRECT:/auth/verify?email=${encodeURIComponent(email)}`
+            );
+          }
+        }
+      }
+      return true;
+    },
+
     async jwt({ token, user }) {
       if (user) {
         token.sub = user.id;
@@ -187,12 +214,7 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
         token.emailVerified = user.emailVerified
           ? new Date(user.emailVerified).toISOString()
           : null;
-
-        // ✅ 이메일 미인증 플래그 세팅
-        const emailIsPlaceholder =
-          user.email?.endsWith("@placeholder.local") ?? false;
-        token.unverified = !user.emailVerified || emailIsPlaceholder;
-
+        token.unverified = !user.emailVerified;
         if (token.sub) {
           await sessionCache.set(`session:user:${token.sub}`, {
             role: token.role,
@@ -206,19 +228,6 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
               : null,
           });
         }
-      } else if (token.sub) {
-        // 세션 갱신 시 DB에서 최신값 반영
-        const freshUser = await prisma.user.findUnique({
-          where: { id: token.sub },
-          select: { emailVerified: true, trustedEmail: true },
-        });
-        if (freshUser) {
-          token.emailVerified = freshUser.emailVerified
-            ? new Date(freshUser.emailVerified).toISOString()
-            : null;
-          token.trustedEmail = freshUser.trustedEmail ?? token.trustedEmail;
-          token.unverified = !freshUser.emailVerified;
-        }
       }
       return token;
     },
@@ -229,7 +238,7 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
         id: token.sub,
         role: token.role as Role,
         status: token.status as UserStatus,
-        unverified: token.unverified as boolean, // 홈 배너에서 사용
+        unverified: token.unverified as boolean,
         trustedEmail: token.trustedEmail as string | null,
         subscriptionExpiresAt: token.subscriptionExpiresAt
           ? new Date(token.subscriptionExpiresAt)
@@ -268,9 +277,13 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
           orderBy: { createdAt: "desc" },
           take: 5,
         });
+
+        // 새로운 디바이스 여부 확인
         const isNewDevice = recent.every(
           (r) => r.ip !== ip || r.userAgent !== userAgent
         );
+
+        // 새로운 디바이스라면 알림 메일 발송
         if (isNewDevice && user.email) {
           await sendLoginAlertEmail(user.email, { ip, userAgent, location });
         }

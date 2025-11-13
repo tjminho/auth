@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -21,79 +21,107 @@ export default function VerifyPage() {
   const searchParams = useSearchParams();
   const { data: session, update } = useSession();
 
-  const vid = searchParams.get("vid") || "";
+  // 회원가입에서 진입 여부
+  const autoSent = searchParams.get("autoSent") === "true";
+
+  // 쿼리/세션 기반 이메일/vid
+  const vid = (searchParams.get("vid") || "").trim();
   const emailFromQuery = (searchParams.get("email") || "").trim().toLowerCase();
-  const email = session?.user?.email?.trim().toLowerCase() || emailFromQuery || "";
+  const sessionEmail = (session?.user?.email || "").trim().toLowerCase();
+  const email = useMemo(
+    () => sessionEmail || emailFromQuery || "",
+    [sessionEmail, emailFromQuery]
+  );
   const isPlaceholder = email.endsWith("@placeholder.local");
 
+  // 상태 관리
   const [status, setStatus] = useState<Status>("init");
   const [resending, setResending] = useState(false);
   const [rateLimited, setRateLimited] = useState(false);
   const [retryAfter, setRetryAfter] = useState<number>(0);
   const [inputEmail, setInputEmail] = useState("");
-  const [mailSent, setMailSent] = useState(false);
+  // ✅ mailSent 초기값을 autoSent로 설정
+  const [mailSent, setMailSent] = useState(autoSent);
 
+  // 현재 상태 ref (중복 완료 방지)
   const statusRef = useRef<Status>("init");
   const safeSetStatus = (next: Status) => {
     setStatus(next);
     statusRef.current = next;
   };
 
-  // ✅ 세션 확인 (백업 폴링)
-  const checkSession = useCallback(async () => {
+// 인증 완료 처리 공통 핸들러
+const handleVerified = useCallback(async () => {
+  if (statusRef.current === "verified") return;
+  safeSetStatus("verified");
+  toast.success("이메일 인증이 완료되었습니다!");
+  try {
+    await update();
+    router.replace("/");
+  } catch {
+    router.refresh();
+    router.replace("/");
+  }
+}, [router, update]);
+
+
+  // 세션 폴링 (백업 확인)
+  const checkSession = useCallback(async (signal?: AbortSignal) => {
     try {
       const res = await fetch("/api/auth/session", {
         method: "GET",
         credentials: "include",
         headers: { "Cache-Control": "no-cache" },
+        signal,
       });
       if (!res.ok) return;
       const json = await res.json().catch(() => null);
       const verifiedAt = json?.user?.emailVerified;
-      if (verifiedAt && statusRef.current !== "verified") {
-        safeSetStatus("verified");
-        toast.success("이메일 인증이 완료되었습니다!");
-        try {
-          await update();
-        } catch {
-          router.refresh();
-        }
-        setTimeout(() => router.replace("/"), 1000);
+      if (verifiedAt) {
+        await handleVerified();
       }
     } catch {
-      // 네트워크 오류 무시
+      // 네트워크 오류/취소는 무시
     }
-  }, [update, router]);
+  }, [handleVerified]);
 
-  // ✅ SSE 연결
+  // SSE 연결
   useEffect(() => {
     if (!vid) return;
 
-    const es = new EventSource(`/api/auth/verification-stream?vid=${vid}`);
+    const es = new EventSource(`/api/auth/verification-stream?vid=${encodeURIComponent(vid)}`);
     safeSetStatus("connected");
 
-    es.addEventListener("connected", () => safeSetStatus("waiting"));
-
-    es.addEventListener("verified", async () => {
-      if (statusRef.current !== "verified") {
-        safeSetStatus("verified");
-        toast.success("이메일 인증이 완료되었습니다!");
-        try {
-          await update();
-        } catch {
-          router.refresh();
-        }
-        setTimeout(() => router.replace("/"), 1000);
+    const onConnected = () => {
+      if (statusRef.current === "init" || statusRef.current === "connected") {
+        safeSetStatus("waiting");
       }
-    });
+    };
 
-    es.addEventListener("error", () => {
+    const onVerified = () => {
+      handleVerified();
+    };
+
+    const onError = () => {
       if (statusRef.current !== "verified") {
         safeSetStatus("error");
         toast.error("인증 처리 중 오류가 발생했습니다.");
       }
       es.close();
-    });
+    };
+
+    const onExpired = () => {
+      if (statusRef.current !== "verified") {
+        safeSetStatus("timeout");
+        toast.error("인증 링크가 만료되었습니다. 새 인증 메일을 요청해주세요.");
+      }
+      es.close();
+    };
+
+    es.addEventListener("connected", onConnected);
+    es.addEventListener("verified", onVerified);
+    es.addEventListener("error", onError);
+    es.addEventListener("expired", onExpired);
 
     const timeout = setTimeout(() => {
       if (statusRef.current !== "verified") {
@@ -104,94 +132,135 @@ export default function VerifyPage() {
     }, 10 * 60 * 1000);
 
     return () => {
+      es.removeEventListener("connected", onConnected);
+      es.removeEventListener("verified", onVerified);
+      es.removeEventListener("error", onError);
+      es.removeEventListener("expired", onExpired);
       es.close();
       clearTimeout(timeout);
     };
-  }, [vid, update, router]);
+  }, [vid, handleVerified]);
 
-  // ✅ 세션 폴링 (백업)
+  // 세션 폴링 루프 + 가시성 변화 시 즉시 확인
   useEffect(() => {
-    checkSession();
-    const timer = setInterval(checkSession, 5000);
-    return () => clearInterval(timer);
+    const ac = new AbortController();
+    const tick = () => checkSession(ac.signal);
+    tick();
+    const timer = setInterval(tick, 5000);
+
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      ac.abort();
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [checkSession]);
 
-  // ✅ 이메일 검증
-  const isEmailValid = (val: string) =>
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val) && !val.endsWith("@placeholder.local");
+  // 이메일 검증
+  const isEmailValid = useCallback(
+    (val: string) =>
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val) && !val.endsWith("@placeholder.local"),
+    []
+  );
 
-  // ✅ 이메일 업데이트 + 인증 메일 발송
-  async function handleResend(targetEmail: string) {
-    const trimmed = (targetEmail || "").trim().toLowerCase();
-    if (!trimmed) return toast.error("이메일을 입력하세요.");
-    if (!isEmailValid(trimmed)) return toast.error("유효한 이메일을 입력하세요.");
-    if (mailSent) return; // ✅ 중복 방지
-    setResending(true);
+  // 이메일 업데이트 + 인증 메일 발송
+  const handleResend = useCallback(
+    async (targetEmail: string) => {
+      const trimmed = (targetEmail || "").trim().toLowerCase();
+      if (!trimmed) return toast.error("이메일을 입력하세요.");
+      if (!isEmailValid(trimmed)) return toast.error("유효한 이메일을 입력하세요.");
+      if (mailSent || resending || rateLimited) return;
 
-    try {
-      const updateRes = await fetch("/api/auth/update-email", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ email: trimmed }),
-      });
-      const updateData = await updateRes.json().catch(() => ({}));
+      setResending(true);
+      const ac = new AbortController();
 
-      if (!updateRes.ok) {
-        if (updateRes.status === 401) {
-          toast.error("로그인 후 이메일 변경이 가능합니다.");
-        } else {
-          toast.error(updateData?.message || "이메일 업데이트에 실패했습니다.");
+      try {
+        if (isPlaceholder) {
+          const updateRes = await fetch("/api/auth/update-email", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ email: trimmed }),
+            signal: ac.signal,
+          });
+          const updateData = await updateRes.json().catch(() => ({}));
+          if (!updateRes.ok) {
+            if (updateRes.status === 401) {
+              toast.error("로그인 후 이메일 변경이 가능합니다.");
+            } else {
+              toast.error(updateData?.message || "이메일 업데이트에 실패했습니다.");
+            }
+            return;
+          }
         }
-        return;
+
+        const res = await fetch("/api/auth/resend-verification", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ email: trimmed }),
+          signal: ac.signal,
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (
+          res.ok &&
+          (data?.sent === true || data?.code === "MAIL_SENT" || data?.code === "EMAIL_SENT")
+        ) {
+          toast.success("인증 메일을 발송했습니다.");
+          setMailSent(true);
+          return;
+        }
+
+        if (data?.code === "RATE_LIMITED") {
+          const retry = Number(data?.retryAfter || 60);
+          setRateLimited(true);
+          setRetryAfter(retry);
+          toast.error(`요청이 너무 많습니다. ${retry}초 후 다시 시도해주세요.`);
+          setTimeout(() => {
+            setRateLimited(false);
+            setRetryAfter(0);
+          }, retry * 1000);
+          return;
+        }
+
+        if (data?.code === "ALREADY_VERIFIED") {
+          toast.success("이미 인증된 이메일입니다.");
+          router.replace("/");
+          return;
+        }
+
+        toast.error(data?.message || "메일 발송에 실패했습니다.");
+      } catch {
+        toast.error("서버와의 통신 중 오류가 발생했습니다.");
+      } finally {
+        setResending(false);
+        ac.abort();
       }
+    },
+    [isPlaceholder, isEmailValid, mailSent, resending, rateLimited, router]
+  );
 
-      const res = await fetch("/api/auth/resend-verification", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ email: trimmed }),
-      });
-
-      const data = await res.json().catch(() => ({}));
-
-      if (res.ok && (data?.sent === true || data?.code === "MAIL_SENT")) {
-        toast.success("인증 메일을 발송했습니다.");
-        setMailSent(true);
-        return;
-      }
-
-      if (data?.code === "RATE_LIMITED") {
-        setRateLimited(true);
-        setRetryAfter(data?.retryAfter || 60);
-        toast.error(`요청이 너무 많습니다. ${data?.retryAfter || 60}초 후 다시 시도해주세요.`);
-        setTimeout(() => {
-          setRateLimited(false);
-          setRetryAfter(0);
-        }, (data?.retryAfter || 60) * 1000);
-        return;
-      }
-
-      if (data?.code === "ALREADY_VERIFIED") {
-        toast.success("이미 인증된 이메일입니다.");
-        router.replace("/");
-        return;
-      }
-
-      toast.error(data?.message || "메일 발송에 실패했습니다.");
-    } catch {
-      toast.error("서버와의 통신 중 오류가 발생했습니다.");
-    } finally {
-      setResending(false);
-    }
-  }
-
-  // ✅ 최초 진입 시 자동 발송 (신규 가입 케이스)
+  // 최초 진입 시 자동 발송 (신규 가입 케이스)
   useEffect(() => {
-    if (email && !isPlaceholder && !session?.user?.emailVerified && !mailSent) {
+    const alreadyVerified = Boolean(session?.user?.emailVerified);
+
+    // 가입 직후 자동 발송 케이스는 여기서 바로 return
+    if (autoSent) {
+      return;
+    }
+
+    if (email && !isPlaceholder && !alreadyVerified && !mailSent) {
       handleResend(email);
     }
-  }, [email, session?.user?.emailVerified, mailSent]);
+  }, [email, isPlaceholder, session?.user?.emailVerified, mailSent, autoSent, handleResend]);
 
   return (
     <div className="mx-auto max-w-md">
@@ -201,7 +270,11 @@ export default function VerifyPage() {
           <CardDescription>
             {isPlaceholder
               ? "현재 계정은 placeholder 이메일입니다. 반드시 실제 이메일을 입력해야 합니다."
-              : `${email} 주소로 인증 메일을 보냈습니다.`}
+              : email
+              ? autoSent
+                ? `${email} 주소로 가입 시 인증 메일을 이미 발송했습니다.`
+                : `${email} 주소로 인증 메일을 보냈습니다.`
+              : "이메일 정보를 확인하고 인증을 진행해주세요."}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -251,7 +324,7 @@ export default function VerifyPage() {
               </p>
               <Button
                 onClick={() => handleResend(email)}
-                disabled={resending || rateLimited || mailSent}
+                disabled={resending || rateLimited || mailSent || !isEmailValid(email)}
                 className="w-full"
                 variant="secondary"
               >
@@ -289,9 +362,7 @@ export default function VerifyPage() {
             </p>
           )}
           {status === "error" && (
-            <p className="text-sm text-red-600">
-              오류가 발생했습니다. 다시 시도해주세요.
-            </p>
+            <p className="text-sm text-red-600">오류가 발생했습니다. 다시 시도해주세요.</p>
           )}
         </CardContent>
       </Card>

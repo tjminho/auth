@@ -32,7 +32,11 @@ export async function POST(req: Request) {
     if (!email || typeof email !== "string" || !email.includes("@")) {
       logger.warn("재발송 요청 실패: 이메일 누락/형식 오류", { ip, ua });
       return NextResponse.json(
-        { code: "EMAIL_REQUIRED", message: "올바른 이메일이 필요합니다." },
+        {
+          success: false,
+          code: "EMAIL_REQUIRED",
+          message: "올바른 이메일이 필요합니다.",
+        },
         { status: 400 }
       );
     }
@@ -64,6 +68,7 @@ export async function POST(req: Request) {
       });
       return NextResponse.json(
         {
+          success: false,
           code: "RATE_LIMITED",
           message: "요청이 너무 많습니다. 잠시 후 다시 시도하세요.",
           retryAfter: limit.retryAfter,
@@ -86,7 +91,11 @@ export async function POST(req: Request) {
         ip,
       });
       const response = NextResponse.json(
-        { code: "USER_NOT_FOUND", message: "해당 유저를 찾을 수 없습니다." },
+        {
+          success: false,
+          code: "USER_NOT_FOUND",
+          message: "해당 유저를 찾을 수 없습니다.",
+        },
         { status: 404 }
       );
       return clearAuthCookies(response);
@@ -99,7 +108,11 @@ export async function POST(req: Request) {
         ip,
       });
       return NextResponse.json(
-        { code: "ALREADY_VERIFIED", message: "이미 인증된 계정입니다." },
+        {
+          success: true,
+          code: "ALREADY_VERIFIED",
+          message: "이미 인증된 계정입니다.",
+        },
         { status: 200 }
       );
     }
@@ -114,6 +127,7 @@ export async function POST(req: Request) {
       logger.error("재발송 실패: 발송 대상 이메일 없음", { userId: user.id });
       return NextResponse.json(
         {
+          success: false,
           code: "NO_TARGET_EMAIL",
           message: "발송 대상 이메일을 찾을 수 없습니다.",
         },
@@ -138,6 +152,7 @@ export async function POST(req: Request) {
 
       return NextResponse.json(
         {
+          success: true,
           code: "MAIL_SENT",
           message: "인증 메일을 발송했습니다.",
           vid: result.vid,
@@ -149,8 +164,14 @@ export async function POST(req: Request) {
     }
 
     // 다른 케이스 처리 (예: RESEND_FAILED, INVALID_EMAIL 등)
+    logger.warn("재발송 실패", {
+      userId: user.id,
+      code: result.code,
+      msg: result.message,
+    });
     return NextResponse.json(
       {
+        success: false,
         ...result,
         message: result.message ?? "재발송 처리 중 오류가 발생했습니다.",
       },
@@ -162,7 +183,11 @@ export async function POST(req: Request) {
       stack: err?.stack,
     });
     return NextResponse.json(
-      { code: "SERVER_ERROR", message: err?.message || "재발송 실패" },
+      {
+        success: false,
+        code: "SERVER_ERROR",
+        message: err?.message || "재발송 실패",
+      },
       { status: 500 }
     );
   }

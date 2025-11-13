@@ -20,6 +20,7 @@ export async function GET(req: NextRequest) {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
+    "Transfer-Encoding": "chunked",
   });
 
   const stream = new ReadableStream({
@@ -32,7 +33,7 @@ export async function GET(req: NextRequest) {
       }
 
       // 연결 성공 이벤트
-      send("connected", { vid });
+      send("connected", { success: true, vid });
       logger.info("SSE 연결 시작", { vid });
 
       const interval = setInterval(async () => {
@@ -42,57 +43,60 @@ export async function GET(req: NextRequest) {
           });
 
           if (!session) {
-            send("error", { code: "NOT_FOUND" });
-            clearInterval(interval);
-            controller.close();
+            send("error", { success: false, code: "NOT_FOUND" });
+            cleanup();
             return;
           }
 
           if (session.verifiedAt) {
             send("verified", {
+              success: true,
               vid,
               userId: session.userId,
               email: session.email,
             });
-            clearInterval(interval);
-            controller.close();
+            cleanup();
             return;
           }
 
           if (session.expiresAt && session.expiresAt.getTime() < Date.now()) {
-            send("expired", { vid });
-            clearInterval(interval);
-            controller.close();
+            send("expired", { success: false, vid });
+            cleanup();
             return;
           }
 
           // 아직 인증 안 됨 → keep-alive
-          send("waiting", { vid });
+          send("waiting", { success: true, vid });
           // ping 이벤트로 연결 유지
           send("ping", { ts: Date.now() });
         } catch (err: any) {
           logger.error("SSE 인증 상태 확인 실패", { vid, error: String(err) });
-          send("error", { code: "SERVER_ERROR" });
-          clearInterval(interval);
-          controller.close();
+          send("error", { success: false, code: "SERVER_ERROR" });
+          cleanup();
         }
       }, 5000); // 5초마다 확인
 
-      // ✅ 타임아웃 처리 (60초 후 자동 종료)
-      const timeout = setTimeout(() => {
-        send("timeout", { vid });
-        clearInterval(interval);
-        controller.close();
-        logger.info("SSE 연결 타임아웃 종료", { vid });
-      }, 60_000);
+      // ✅ 타임아웃 처리 (10분 후 자동 종료)
+      const timeout = setTimeout(
+        () => {
+          send("timeout", { success: false, vid });
+          cleanup();
+          logger.info("SSE 연결 타임아웃 종료", { vid });
+        },
+        10 * 60 * 1000
+      );
 
       // ✅ 연결 종료 처리
       req.signal.addEventListener("abort", () => {
+        cleanup();
+        logger.info("SSE 연결 종료", { vid });
+      });
+
+      function cleanup() {
         clearInterval(interval);
         clearTimeout(timeout);
         controller.close();
-        logger.info("SSE 연결 종료", { vid });
-      });
+      }
     },
   });
 

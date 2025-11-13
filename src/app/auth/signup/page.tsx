@@ -69,6 +69,7 @@ export default function SignupPage() {
       const res = await fetch("/api/auth/signup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include", // ✅ 세션 쿠키 포함
         body: JSON.stringify(values),
       });
 
@@ -79,38 +80,45 @@ export default function SignupPage() {
         data = {};
       }
 
-      if (!res.ok || !data?.success) {
+      // 실패 처리
+      if (!res.ok || data?.success === false) {
         const msg =
-          errorMessages[data?.error as keyof typeof errorMessages] ||
+          errorMessages[data?.code as keyof typeof errorMessages] ||
           data?.message ||
           errorMessages.default;
         toast.error(msg);
 
-        // ✅ 이미 가입된 이메일인데 인증 안 된 경우 → signin으로 이동
-        if (data?.error === "EMAIL_NOT_VERIFIED") {
-          router.push("/auth/signin?reason=EMAIL_NOT_VERIFIED");
+        // 인증 미완료 케이스는 로그인으로 유도
+        if (data?.code === "EMAIL_NOT_VERIFIED") {
+          router.push(
+            `/auth/signin?email=${encodeURIComponent(values.email)}&reason=EMAIL_NOT_VERIFIED`
+          );
           return;
         }
 
-        // ✅ 기타 redirect 처리
+        // 서버가 안내한 redirect가 있으면 그대로 이동
         if (data?.redirect) {
-          router.push(data.redirect);
+          router.replace(data.redirect);
         }
         return;
       }
 
-      // ✅ 신규 가입 성공
+      // 성공 처리
       const targetEmail = data?.email || values.email;
-      const vid = data?.vid;
       toast.success(`${targetEmail} 주소로 인증 메일을 발송했습니다.`);
 
-      router.push(
-        `/auth/verify?email=${encodeURIComponent(targetEmail)}${
-          vid ? `&vid=${encodeURIComponent(vid)}` : ""
-        }`
+      // 반드시 서버 redirect 사용
+      if (data?.redirect) {
+        router.replace(data.redirect);
+        return;
+      }
+
+      // 안전장치: redirect 누락 시 autoSent=true 포함
+      router.replace(
+        `/auth/verify?email=${encodeURIComponent(targetEmail)}&autoSent=true`
       );
     } catch (e: any) {
-      toast.error(e.message || "네트워크 오류가 발생했습니다.");
+      toast.error(e?.message || "네트워크 오류가 발생했습니다.");
     } finally {
       setLoading(false);
     }
